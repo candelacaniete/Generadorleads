@@ -3,8 +3,8 @@
 Panel unificado en Streamlit para el ciclo de prospección B2B:
 
 1. Sourcing de leads (Places / SerpAPI / Outscraper / Bright Data / Apollo / Clay / IG-FB / Directorios AR, o simulación)
-2. Scoring e icebreakers con OpenAI / Claude
-3. Despacho outbound a Instantly o webhook Make/n8n
+2. Enrichment (email + LinkedIn) y scrape web → dolores / icebreaker con Claude
+3. Scoring supervisado + despacho outbound (Instantly / webhook)
 4. CRM local con pipeline y exportación CSV/Excel
 
 ## Producto multi-cliente (vertical Katem)
@@ -35,4 +35,4 @@ cp .env.example .env       # completar API keys opcionales
 streamlit run app.py
 ```
 
-Sin API keys la app sigue siendo usable: sourcing simulado, scoring heurístico local y validación de payloads de despacho.
+Sin API keys la app sigue siendo usable: sourcing simulado, scrape+dolores heurísticos, scoring local y validación de payloads de despacho. Con `ANTHROPIC_API_KEY`, el paso Web/Dolores usa Claude sobre el texto scrapado.
