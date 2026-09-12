@@ -7,6 +7,15 @@ Panel unificado en Streamlit para el ciclo de prospección B2B:
 3. Despacho outbound a Instantly o webhook Make/n8n
 4. CRM local con pipeline y exportación CSV/Excel
 
+## Pipeline supervisado
+
+El flujo **no se ejecuta todo junto**: cada etapa tiene una puerta de aprobación.
+
+1. **Sourcing** → buscá, seleccioná y aprobá para pasar a scoring  
+2. **Scoring** → modo *uno a uno* (recomendado) o lote con confirmación; revisá score/icebreaker  
+3. **Despacho** → aprobá leads High uno a uno o en lote confirmado  
+4. **CRM** → actualizá estados y exportá  
+
 ## Inicio rápido
 
 ```bash

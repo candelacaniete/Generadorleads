@@ -96,6 +96,18 @@ def init_session_state() -> None:
         "dispatch_log": load_dispatch_log(),
         "last_search_meta": {},
         "api_errors": [],
+        # Pipeline supervisado por pasos
+        "pipeline_step": 1,  # 1 sourcing, 2 scoring, 3 dispatch, 4 crm
+        "step1_approved": False,
+        "step2_approved": False,
+        "scoring_mode": "Uno a uno (supervisado)",
+        "scoring_queue_ids": [],
+        "scoring_queue_idx": 0,
+        "scoring_current_result": None,
+        "dispatch_mode": "Uno a uno (supervisado)",
+        "dispatch_queue_ids": [],
+        "dispatch_queue_idx": 0,
+        "dispatch_approved_ids": [],
     }
     for key, value in defaults.items():
         if key not in st.session_state:
@@ -544,6 +556,41 @@ def score_lead_anthropic(
     }
 
 
+def score_one_lead(
+    lead: dict[str, Any],
+    provider: str,
+    openai_key: str,
+    anthropic_key: str,
+    openai_model: str,
+    anthropic_model: str,
+) -> dict[str, Any]:
+    """Califica un único lead (modo supervisado o lote)."""
+    try:
+        if provider == "OpenAI (GPT-4o)" and openai_key:
+            scored = score_lead_openai(lead, openai_key, openai_model)
+            scored["scoring_fuente"] = "openai"
+        elif provider == "Anthropic (Claude)" and anthropic_key:
+            scored = score_lead_anthropic(lead, anthropic_key, anthropic_model)
+            scored["scoring_fuente"] = "anthropic"
+        else:
+            scored = _heuristic_score(lead)
+            scored["scoring_fuente"] = "heuristica_local"
+    except Exception as exc:  # noqa: BLE001
+        scored = _heuristic_score(lead)
+        scored["scoring_fuente"] = f"fallback_error:{exc}"
+        scored["score_razon"] = (
+            f"[Fallback local] {scored['score_razon']} "
+            f"(API error: {exc})"
+        )
+
+    merged = {**lead, **scored}
+    score_norm = _safe_str(merged.get("lead_score")).title()
+    if score_norm not in {"High", "Medium", "Low"}:
+        score_norm = "Medium"
+    merged["lead_score"] = score_norm
+    return merged
+
+
 def score_leads_batch(
     leads_df: pd.DataFrame,
     provider: str,
@@ -557,31 +604,14 @@ def score_leads_batch(
     total = len(leads_df)
 
     for idx, (_, row) in enumerate(leads_df.iterrows()):
-        lead = row.to_dict()
-        try:
-            if provider == "OpenAI (GPT-4o)" and openai_key:
-                scored = score_lead_openai(lead, openai_key, openai_model)
-                scored["scoring_fuente"] = "openai"
-            elif provider == "Anthropic (Claude)" and anthropic_key:
-                scored = score_lead_anthropic(lead, anthropic_key, anthropic_model)
-                scored["scoring_fuente"] = "anthropic"
-            else:
-                scored = _heuristic_score(lead)
-                scored["scoring_fuente"] = "heuristica_local"
-        except Exception as exc:  # noqa: BLE001
-            scored = _heuristic_score(lead)
-            scored["scoring_fuente"] = f"fallback_error:{exc}"
-            scored["score_razon"] = (
-                f"[Fallback local] {scored['score_razon']} "
-                f"(API error: {exc})"
-            )
-
-        merged = {**lead, **scored}
-        # Normalizar score
-        score_norm = _safe_str(merged.get("lead_score")).title()
-        if score_norm not in {"High", "Medium", "Low"}:
-            score_norm = "Medium"
-        merged["lead_score"] = score_norm
+        merged = score_one_lead(
+            row.to_dict(),
+            provider,
+            openai_key,
+            anthropic_key,
+            openai_model,
+            anthropic_model,
+        )
         results.append(merged)
         progress.progress((idx + 1) / total, text=f"Calificados {idx + 1}/{total}")
 
@@ -703,6 +733,75 @@ def dispatch_to_webhook(
         return False, 0, str(exc)
 
 
+def dispatch_one_lead(
+    lead: dict[str, Any],
+    mode: str,
+    instantly_key: str,
+    webhook_url: str,
+    campaign_id: str,
+    calendar_url: str,
+    crm: pd.DataFrame | None = None,
+) -> tuple[dict[str, Any], pd.DataFrame]:
+    """Despacha un único lead y actualiza CRM. Retorna (log_row, crm)."""
+    if crm is None:
+        crm = load_crm()
+
+    lead = dict(lead)
+    lead["calendario_url"] = calendar_url or DEFAULT_CALENDAR_URL
+
+    if mode == "Instantly.ai" and instantly_key:
+        ok, status, detail = dispatch_to_instantly(lead, instantly_key, campaign_id)
+        destino = "instantly"
+    elif mode == "Webhook (Make/n8n)" and webhook_url:
+        ok, status, detail = dispatch_to_webhook(lead, webhook_url, campaign_id)
+        destino = "webhook"
+    else:
+        ok, status, detail = False, 0, "Falta API key o URL de webhook"
+        destino = mode.lower()
+
+    log_row = {
+        "timestamp": _utc_now_iso(),
+        "lead_id": _safe_str(lead.get("id")),
+        "nombre": _safe_str(lead.get("nombre")),
+        "destino": destino,
+        "http_status": str(status),
+        "exito": "sí" if ok else "no",
+        "detalle": detail,
+    }
+
+    now = _utc_now_iso()
+    crm_row = {
+        "id": _safe_str(lead.get("id")) or str(uuid.uuid4())[:8],
+        "nombre": _safe_str(lead.get("nombre")),
+        "direccion": _safe_str(lead.get("direccion")),
+        "telefono": _safe_str(lead.get("telefono")),
+        "website": _safe_str(lead.get("website")),
+        "rating": _safe_str(lead.get("rating")),
+        "status_places": _safe_str(lead.get("status_places")),
+        "rubro": _safe_str(lead.get("rubro")),
+        "ubicacion": _safe_str(lead.get("ubicacion")),
+        "lead_score": _safe_str(lead.get("lead_score")),
+        "score_razon": _safe_str(lead.get("score_razon")),
+        "icebreaker": _safe_str(lead.get("icebreaker")),
+        "pipeline_status": "Contactado" if ok else "Nuevo",
+        "calendario_url": calendar_url or DEFAULT_CALENDAR_URL,
+        "notas": f"Despacho {destino}: {'OK' if ok else 'FALLÓ'} — {detail[:120]}",
+        "fecha_creacion": now,
+        "fecha_actualizacion": now,
+    }
+
+    if not crm.empty and (crm["id"] == crm_row["id"]).any():
+        mask = crm["id"] == crm_row["id"]
+        for k, v in crm_row.items():
+            if k == "fecha_creacion":
+                continue
+            crm.loc[mask, k] = v
+    else:
+        crm = pd.concat([crm, pd.DataFrame([crm_row])], ignore_index=True)
+
+    return log_row, crm
+
+
 def dispatch_high_leads(
     leads_df: pd.DataFrame,
     mode: str,
@@ -717,62 +816,16 @@ def dispatch_high_leads(
     total = max(len(leads_df), 1)
 
     for idx, (_, row) in enumerate(leads_df.iterrows()):
-        lead = row.to_dict()
-        lead["calendario_url"] = calendar_url or DEFAULT_CALENDAR_URL
-
-        if mode == "Instantly.ai" and instantly_key:
-            ok, status, detail = dispatch_to_instantly(lead, instantly_key, campaign_id)
-            destino = "instantly"
-        elif mode == "Webhook (Make/n8n)" and webhook_url:
-            ok, status, detail = dispatch_to_webhook(lead, webhook_url, campaign_id)
-            destino = "webhook"
-        else:
-            ok, status, detail = False, 0, "Falta API key o URL de webhook"
-            destino = mode.lower()
-
-        log_rows.append(
-            {
-                "timestamp": _utc_now_iso(),
-                "lead_id": _safe_str(lead.get("id")),
-                "nombre": _safe_str(lead.get("nombre")),
-                "destino": destino,
-                "http_status": str(status),
-                "exito": "sí" if ok else "no",
-                "detalle": detail,
-            }
+        log_row, crm = dispatch_one_lead(
+            row.to_dict(),
+            mode,
+            instantly_key,
+            webhook_url,
+            campaign_id,
+            calendar_url,
+            crm=crm,
         )
-
-        # Upsert en CRM local
-        now = _utc_now_iso()
-        crm_row = {
-            "id": _safe_str(lead.get("id")) or str(uuid.uuid4())[:8],
-            "nombre": _safe_str(lead.get("nombre")),
-            "direccion": _safe_str(lead.get("direccion")),
-            "telefono": _safe_str(lead.get("telefono")),
-            "website": _safe_str(lead.get("website")),
-            "rating": _safe_str(lead.get("rating")),
-            "status_places": _safe_str(lead.get("status_places")),
-            "rubro": _safe_str(lead.get("rubro")),
-            "ubicacion": _safe_str(lead.get("ubicacion")),
-            "lead_score": _safe_str(lead.get("lead_score")),
-            "score_razon": _safe_str(lead.get("score_razon")),
-            "icebreaker": _safe_str(lead.get("icebreaker")),
-            "pipeline_status": "Contactado" if ok else "Nuevo",
-            "calendario_url": calendar_url or DEFAULT_CALENDAR_URL,
-            "notas": f"Despacho {destino}: {'OK' if ok else 'FALLÓ'} — {detail[:120]}",
-            "fecha_creacion": now,
-            "fecha_actualizacion": now,
-        }
-
-        if not crm.empty and (crm["id"] == crm_row["id"]).any():
-            mask = crm["id"] == crm_row["id"]
-            for k, v in crm_row.items():
-                if k == "fecha_creacion":
-                    continue
-                crm.loc[mask, k] = v
-        else:
-            crm = pd.concat([crm, pd.DataFrame([crm_row])], ignore_index=True)
-
+        log_rows.append(log_row)
         progress.progress((idx + 1) / total, text=f"Enviados {idx + 1}/{len(leads_df)}")
 
     progress.empty()
@@ -855,11 +908,86 @@ def render_sidebar() -> dict[str, str]:
 # ---------------------------------------------------------------------------
 # UI — Tabs
 # ---------------------------------------------------------------------------
+
+def get_selected_sourced_leads() -> pd.DataFrame:
+    sourced = st.session_state.sourced_leads
+    if not isinstance(sourced, pd.DataFrame) or sourced.empty:
+        return pd.DataFrame()
+    if "seleccionado" in sourced.columns and sourced["seleccionado"].any():
+        return sourced[sourced["seleccionado"] == True].copy()  # noqa: E712
+    return sourced.copy()
+
+
+def upsert_scored_lead(lead: dict[str, Any]) -> None:
+    """Inserta o actualiza un lead calificado en sesión."""
+    scored = st.session_state.scored_leads
+    row = pd.DataFrame([lead])
+    if not isinstance(scored, pd.DataFrame) or scored.empty:
+        st.session_state.scored_leads = row
+    else:
+        lid = _safe_str(lead.get("id"))
+        if lid and (scored["id"].astype(str) == lid).any():
+            scored = scored[scored["id"].astype(str) != lid]
+        st.session_state.scored_leads = pd.concat([scored, row], ignore_index=True)
+    scored_all = st.session_state.scored_leads
+    st.session_state.high_leads = scored_all[scored_all["lead_score"] == "High"].copy()
+
+
+def render_pipeline_stepper() -> None:
+    """Barra de progreso del pipeline supervisado (paso a paso)."""
+    steps = [
+        (1, "🔍 Sourcing"),
+        (2, "🧠 Scoring"),
+        (3, "🚀 Despacho"),
+        (4, "📊 CRM"),
+    ]
+    current = int(st.session_state.get("pipeline_step", 1))
+    cols = st.columns(4)
+    for (num, label), col in zip(steps, cols):
+        if num < current:
+            col.success(f"✓ {label}")
+        elif num == current:
+            col.info(f"▶ Paso {num}: {label}")
+        else:
+            col.caption(f"○ {label}")
+
+    c1, c2, c3 = st.columns([2, 1, 1])
+    with c1:
+        st.caption(
+            "Modo supervisado: cada etapa requiere tu revisión y aprobación explícita "
+            "antes de avanzar. Podés calificar y despachar de a uno."
+        )
+    with c2:
+        if st.button("↺ Reiniciar pipeline", use_container_width=True):
+            st.session_state.pipeline_step = 1
+            st.session_state.step1_approved = False
+            st.session_state.step2_approved = False
+            st.session_state.scoring_queue_ids = []
+            st.session_state.scoring_queue_idx = 0
+            st.session_state.scoring_current_result = None
+            st.session_state.dispatch_queue_ids = []
+            st.session_state.dispatch_queue_idx = 0
+            st.session_state.dispatch_approved_ids = []
+            st.rerun()
+    with c3:
+        jump = st.selectbox(
+            "Ir al paso",
+            options=[1, 2, 3, 4],
+            format_func=lambda n: steps[n - 1][1],
+            index=current - 1,
+            label_visibility="collapsed",
+        )
+        if jump != current:
+            st.session_state.pipeline_step = int(jump)
+            st.rerun()
+    st.divider()
+
+
 def tab_sourcing(cfg: dict[str, str]) -> None:
-    st.subheader("🔍 Búsqueda de Leads (Sourcing)")
+    st.subheader("🔍 Paso 1 — Búsqueda de Leads (Sourcing)")
     st.write(
-        "Buscá negocios locales o B2B por rubro y ubicación. "
-        "Sin `GOOGLE_MAPS_KEY` se genera una extracción estructurada simulada lista para el pipeline."
+        "Buscá negocios por rubro y ubicación. Revisá la tabla, seleccioná cuáles "
+        "continúan al scoring y **aprobá el paso** para avanzar."
     )
 
     with st.form("form_sourcing"):
@@ -884,6 +1012,8 @@ def tab_sourcing(cfg: dict[str, str]) -> None:
                     cfg["google_key"],
                 )
             st.session_state.sourced_leads = df
+            st.session_state.step1_approved = False
+            st.session_state.pipeline_step = 1
             st.session_state.last_search_meta = {
                 "nicho": nicho,
                 "ubicacion": ubicacion,
@@ -891,15 +1021,15 @@ def tab_sourcing(cfg: dict[str, str]) -> None:
                 "mode": mode,
                 "at": _utc_now_iso(),
             }
-            st.success(f"Se obtuvieron {len(df)} leads · modo: `{mode}`")
+            st.success(f"Se obtuvieron {len(df)} leads · modo: `{mode}` — revisalos antes de avanzar.")
 
     df = st.session_state.sourced_leads
     meta = st.session_state.last_search_meta
 
     m1, m2, m3, m4 = st.columns(4)
     m1.metric("Leads encontrados", len(df) if isinstance(df, pd.DataFrame) else 0)
-    m2.metric("Con website", int(df["website"].astype(str).str.len().gt(0).sum()) if not df.empty else 0)
-    m3.metric("Con teléfono", int(df["telefono"].astype(str).str.len().gt(0).sum()) if not df.empty else 0)
+    m2.metric("Con website", int(df["website"].astype(str).str.len().gt(0).sum()) if isinstance(df, pd.DataFrame) and not df.empty else 0)
+    m3.metric("Con teléfono", int(df["telefono"].astype(str).str.len().gt(0).sum()) if isinstance(df, pd.DataFrame) and not df.empty else 0)
     m4.metric("Fuente", meta.get("mode", "—") if meta else "—")
 
     if isinstance(df, pd.DataFrame) and not df.empty:
@@ -918,11 +1048,7 @@ def tab_sourcing(cfg: dict[str, str]) -> None:
                 "website": st.column_config.LinkColumn("Sitio Web"),
                 "rating": st.column_config.TextColumn("Rating"),
             },
-            disabled=[
-                c
-                for c in editable.columns
-                if c != "seleccionado"
-            ],
+            disabled=[c for c in editable.columns if c != "seleccionado"],
             key="editor_sourcing",
         )
         st.session_state.sourced_leads = edited
@@ -951,153 +1077,266 @@ def tab_sourcing(cfg: dict[str, str]) -> None:
             file_name=f"leads_{meta.get('ubicacion', 'zona')}_{meta.get('nicho', 'nicho')}.csv".replace(" ", "_"),
             mime="text/csv",
         )
+
+        st.markdown("#### Puerta de aprobación — Paso 1 → Paso 2")
+        n_sel = len(st.session_state.selected_lead_ids) or len(edited)
+        confirm = st.checkbox(
+            f"Revisé la lista y quiero calificar {n_sel} lead(s) en el siguiente paso",
+            key="confirm_step1",
+        )
+        if st.button(
+            "Aprobar selección y pasar a Scoring →",
+            type="primary",
+            use_container_width=True,
+            disabled=not confirm,
+        ):
+            ids = st.session_state.selected_lead_ids
+            if not ids:
+                # Si no marcó checkboxes, usa todos
+                ids = edited["id"].astype(str).tolist()
+                edited["seleccionado"] = True
+                st.session_state.sourced_leads = edited
+                st.session_state.selected_lead_ids = ids
+            st.session_state.step1_approved = True
+            st.session_state.pipeline_step = 2
+            st.session_state.scoring_queue_ids = list(ids)
+            st.session_state.scoring_queue_idx = 0
+            st.session_state.scoring_current_result = None
+            st.success("Paso 1 aprobado. Continuá en la pestaña Scoring.")
+            st.rerun()
+
+        if st.session_state.step1_approved:
+            st.success("✓ Paso 1 aprobado — podés trabajar en Scoring.")
     else:
         st.info("Todavía no hay leads. Completá el formulario y tocá **Buscar leads**.")
 
 
 def tab_scoring(cfg: dict[str, str]) -> None:
-    st.subheader("🧠 Scoring e Inteligencia con IA")
+    st.subheader("🧠 Paso 2 — Scoring e Inteligencia (supervisado)")
     st.write(
-        "Calificá los leads seleccionados con GPT-4o o Claude 3.5 Sonnet. "
-        "Sin API key, se aplica un scoring heurístico local 100% funcional."
+        "Calificá leads de a uno (recomendado) o en lote con confirmación. "
+        "Revisá score, razón e icebreaker antes de aprobar el paso de despacho."
     )
 
-    sourced = st.session_state.sourced_leads
-    if not isinstance(sourced, pd.DataFrame) or sourced.empty:
-        st.warning("No hay leads en sesión. Primero buscá en la pestaña de Sourcing.")
+    if not st.session_state.step1_approved:
+        st.warning("Primero aprobá la selección en **Paso 1 (Sourcing)**.")
+        if st.button("Ir a Sourcing"):
+            st.session_state.pipeline_step = 1
+            st.rerun()
         return
 
-    if "seleccionado" in sourced.columns and sourced["seleccionado"].any():
-        to_score = sourced[sourced["seleccionado"] == True].copy()  # noqa: E712
-    else:
-        to_score = sourced.copy()
-        st.caption("No hay selección explícita: se calificarán todos los leads de la búsqueda.")
+    to_score = get_selected_sourced_leads()
+    if to_score.empty:
+        st.warning("No hay leads seleccionados para calificar.")
+        return
 
     c1, c2, c3 = st.columns(3)
     with c1:
         provider = st.selectbox(
             "Proveedor de IA",
-            ["OpenAI (GPT-4o)", "Anthropic (Claude)", "Heurística local (sin API)"],
+            ["Heurística local (sin API)", "OpenAI (GPT-4o)", "Anthropic (Claude)"],
         )
     with c2:
         openai_model = st.text_input("Modelo OpenAI", value="gpt-4o")
     with c3:
-        anthropic_model = st.text_input(
-            "Modelo Anthropic",
-            value="claude-3-5-sonnet-20241022",
-        )
+        anthropic_model = st.text_input("Modelo Anthropic", value="claude-3-5-sonnet-20241022")
 
-    st.metric("Leads a calificar", len(to_score))
+    mode = st.radio(
+        "Modo de ejecución",
+        ["Uno a uno (supervisado)", "Lote completo (con confirmación)"],
+        horizontal=True,
+        key="scoring_mode_radio",
+    )
+    st.session_state.scoring_mode = mode
+    st.metric("Leads en cola", len(to_score))
 
-    if st.button("Calificar con IA", type="primary", use_container_width=True):
-        scored = score_leads_batch(
-            to_score.drop(columns=["seleccionado"], errors="ignore"),
-            provider=provider,
-            openai_key=cfg["openai_key"],
-            anthropic_key=cfg["anthropic_key"],
-            openai_model=openai_model.strip() or "gpt-4o",
-            anthropic_model=anthropic_model.strip() or "claude-3-5-sonnet-20241022",
+    # -------- Modo uno a uno --------
+    if mode.startswith("Uno a uno"):
+        queue_ids = st.session_state.scoring_queue_ids or to_score["id"].astype(str).tolist()
+        if not st.session_state.scoring_queue_ids:
+            st.session_state.scoring_queue_ids = queue_ids
+            st.session_state.scoring_queue_idx = 0
+        idx = int(st.session_state.scoring_queue_idx)
+        total_q = len(st.session_state.scoring_queue_ids)
+
+        if idx >= total_q:
+            st.success(f"Cola de scoring finalizada ({total_q}/{total_q}). Revisá resultados abajo.")
+        else:
+            lead_id = str(st.session_state.scoring_queue_ids[idx])
+            lead_row = to_score[to_score["id"].astype(str) == lead_id]
+            if lead_row.empty:
+                st.session_state.scoring_queue_idx = idx + 1
+                st.rerun()
+            lead = lead_row.iloc[0].to_dict()
+            st.markdown(f"##### Lead {idx + 1} de {total_q}")
+            st.write(
+                {
+                    "nombre": lead.get("nombre"),
+                    "rubro": lead.get("rubro"),
+                    "ubicacion": lead.get("ubicacion"),
+                    "website": lead.get("website"),
+                    "telefono": lead.get("telefono"),
+                    "rating": lead.get("rating"),
+                }
+            )
+
+            b1, b2, b3 = st.columns(3)
+            with b1:
+                if st.button("Calificar este lead", type="primary", use_container_width=True):
+                    result = score_one_lead(
+                        {k: v for k, v in lead.items() if k != "seleccionado"},
+                        provider=provider,
+                        openai_key=cfg["openai_key"],
+                        anthropic_key=cfg["anthropic_key"],
+                        openai_model=openai_model.strip() or "gpt-4o",
+                        anthropic_model=anthropic_model.strip() or "claude-3-5-sonnet-20241022",
+                    )
+                    st.session_state.scoring_current_result = result
+            with b2:
+                if st.button("Omitir lead →", use_container_width=True):
+                    st.session_state.scoring_current_result = None
+                    st.session_state.scoring_queue_idx = idx + 1
+                    st.rerun()
+            with b3:
+                if st.button("Reiniciar cola scoring", use_container_width=True):
+                    st.session_state.scoring_queue_ids = to_score["id"].astype(str).tolist()
+                    st.session_state.scoring_queue_idx = 0
+                    st.session_state.scoring_current_result = None
+                    st.rerun()
+
+            current = st.session_state.scoring_current_result
+            if current and _safe_str(current.get("id")) == lead_id:
+                st.markdown("###### Resultado — revisá antes de guardar")
+                new_score = st.selectbox(
+                    "Lead Score",
+                    ["High", "Medium", "Low"],
+                    index=["High", "Medium", "Low"].index(
+                        _safe_str(current.get("lead_score")) if _safe_str(current.get("lead_score")) in {"High", "Medium", "Low"} else "Medium"
+                    ),
+                    key=f"edit_score_{lead_id}",
+                )
+                new_razon = st.text_area("Razón", value=_safe_str(current.get("score_razon")), key=f"edit_razon_{lead_id}")
+                new_ice = st.text_area("Icebreaker", value=_safe_str(current.get("icebreaker")), key=f"edit_ice_{lead_id}")
+                a1, a2 = st.columns(2)
+                with a1:
+                    if st.button("✓ Guardar y siguiente", type="primary", use_container_width=True):
+                        current = dict(current)
+                        current["lead_score"] = new_score
+                        current["score_razon"] = new_razon
+                        current["icebreaker"] = new_ice
+                        upsert_scored_lead(current)
+                        st.session_state.scoring_current_result = None
+                        st.session_state.scoring_queue_idx = idx + 1
+                        st.rerun()
+                with a2:
+                    if st.button("Descartar resultado", use_container_width=True):
+                        st.session_state.scoring_current_result = None
+                        st.rerun()
+
+    # -------- Modo lote --------
+    else:
+        confirm_batch = st.checkbox(
+            f"Confirmo calificar en lote los {len(to_score)} leads seleccionados",
+            key="confirm_score_batch",
         )
-        st.session_state.scored_leads = scored
-        high = scored[scored["lead_score"] == "High"].copy()
-        st.session_state.high_leads = high
-        st.success(
-            f"Calificación completa: {len(scored)} leads · "
-            f"{len(high)} High · "
-            f"{(scored['lead_score'] == 'Medium').sum()} Medium · "
-            f"{(scored['lead_score'] == 'Low').sum()} Low"
-        )
+        if st.button(
+            "Calificar lote completo",
+            type="primary",
+            use_container_width=True,
+            disabled=not confirm_batch,
+        ):
+            scored = score_leads_batch(
+                to_score.drop(columns=["seleccionado"], errors="ignore"),
+                provider=provider,
+                openai_key=cfg["openai_key"],
+                anthropic_key=cfg["anthropic_key"],
+                openai_model=openai_model.strip() or "gpt-4o",
+                anthropic_model=anthropic_model.strip() or "claude-3-5-sonnet-20241022",
+            )
+            st.session_state.scored_leads = scored
+            st.session_state.high_leads = scored[scored["lead_score"] == "High"].copy()
+            st.session_state.scoring_queue_idx = len(to_score)
+            st.success(
+                f"Lote calificado: {len(scored)} · "
+                f"{(scored['lead_score']=='High').sum()} High · "
+                f"{(scored['lead_score']=='Medium').sum()} Medium · "
+                f"{(scored['lead_score']=='Low').sum()} Low"
+            )
 
     scored = st.session_state.scored_leads
     if isinstance(scored, pd.DataFrame) and not scored.empty:
+        st.markdown("#### Resultados calificados")
         m1, m2, m3, m4 = st.columns(4)
-        m1.metric("Total calificados", len(scored))
+        m1.metric("Total", len(scored))
         m2.metric("High", int((scored["lead_score"] == "High").sum()))
         m3.metric("Medium", int((scored["lead_score"] == "Medium").sum()))
         m4.metric("Low", int((scored["lead_score"] == "Low").sum()))
 
-        only_high = st.toggle("Mostrar solo leads High (filtro automático)", value=True)
+        only_high = st.toggle("Mostrar solo High", value=True)
         view = scored[scored["lead_score"] == "High"] if only_high else scored
-
-        st.dataframe(
-            view[
-                [
-                    c
-                    for c in [
-                        "nombre",
-                        "rubro",
-                        "ubicacion",
-                        "website",
-                        "rating",
-                        "lead_score",
-                        "score_razon",
-                        "icebreaker",
-                        "scoring_fuente",
-                    ]
-                    if c in view.columns
-                ]
-            ],
+        edited_scores = st.data_editor(
+            view.copy(),
             use_container_width=True,
             hide_index=True,
+            column_config={
+                "lead_score": st.column_config.SelectboxColumn("Score", options=["High", "Medium", "Low"]),
+                "website": st.column_config.LinkColumn("Website"),
+                "icebreaker": st.column_config.TextColumn("Icebreaker", width="large"),
+            },
+            key="editor_scored_review",
         )
+        if st.button("Aplicar ediciones de score/icebreaker", use_container_width=True):
+            full = scored.copy()
+            for _, row in edited_scores.iterrows():
+                mask = full["id"].astype(str) == str(row["id"])
+                for col in ["lead_score", "score_razon", "icebreaker"]:
+                    if col in full.columns and col in row:
+                        full.loc[mask, col] = row[col]
+            st.session_state.scored_leads = full
+            st.session_state.high_leads = full[full["lead_score"] == "High"].copy()
+            st.success("Ediciones aplicadas.")
+            st.rerun()
 
-        if st.button("Guardar leads High en CRM local", use_container_width=True):
-            high = scored[scored["lead_score"] == "High"].copy()
-            if high.empty:
-                st.warning("No hay leads High para guardar.")
-            else:
-                crm = load_crm()
-                now = _utc_now_iso()
-                rows = []
-                for _, row in high.iterrows():
-                    rows.append(
-                        {
-                            "id": _safe_str(row.get("id")) or str(uuid.uuid4())[:8],
-                            "nombre": _safe_str(row.get("nombre")),
-                            "direccion": _safe_str(row.get("direccion")),
-                            "telefono": _safe_str(row.get("telefono")),
-                            "website": _safe_str(row.get("website")),
-                            "rating": _safe_str(row.get("rating")),
-                            "status_places": _safe_str(row.get("status_places")),
-                            "rubro": _safe_str(row.get("rubro")),
-                            "ubicacion": _safe_str(row.get("ubicacion")),
-                            "lead_score": "High",
-                            "score_razon": _safe_str(row.get("score_razon")),
-                            "icebreaker": _safe_str(row.get("icebreaker")),
-                            "pipeline_status": "Nuevo",
-                            "calendario_url": cfg["calendar_url"],
-                            "notas": "Importado desde scoring IA",
-                            "fecha_creacion": now,
-                            "fecha_actualizacion": now,
-                        }
-                    )
-                new_df = pd.DataFrame(rows)
-                if crm.empty:
-                    crm = new_df
-                else:
-                    existing_ids = set(crm["id"].tolist())
-                    to_add = new_df[~new_df["id"].isin(existing_ids)]
-                    to_update = new_df[new_df["id"].isin(existing_ids)]
-                    for _, urow in to_update.iterrows():
-                        mask = crm["id"] == urow["id"]
-                        for col in CRM_COLUMNS:
-                            if col == "fecha_creacion":
-                                continue
-                            crm.loc[mask, col] = urow.get(col, "")
-                    crm = pd.concat([crm, to_add], ignore_index=True)
-                save_crm(crm)
-                st.session_state.high_leads = high
-                st.success(f"{len(high)} leads High sincronizados en `{CRM_PATH.name}`.")
+        high = st.session_state.high_leads
+        st.markdown("#### Puerta de aprobación — Paso 2 → Paso 3")
+        n_high = len(high) if isinstance(high, pd.DataFrame) else 0
+        confirm2 = st.checkbox(
+            f"Revisé los scores e icebreakers. Apruebo {n_high} lead(s) High para despacho",
+            key="confirm_step2",
+            disabled=n_high == 0,
+        )
+        if st.button(
+            "Aprobar High y pasar a Despacho →",
+            type="primary",
+            use_container_width=True,
+            disabled=not confirm2 or n_high == 0,
+        ):
+            st.session_state.step2_approved = True
+            st.session_state.pipeline_step = 3
+            st.session_state.dispatch_approved_ids = high["id"].astype(str).tolist()
+            st.session_state.dispatch_queue_ids = high["id"].astype(str).tolist()
+            st.session_state.dispatch_queue_idx = 0
+            st.success("Paso 2 aprobado. Continuá en Despacho Outbound.")
+            st.rerun()
+        if st.session_state.step2_approved:
+            st.success("✓ Paso 2 aprobado — podés despachar en la pestaña Outbound.")
     else:
-        st.info("Ejecutá **Calificar con IA** para ver scores, razones e icebreakers.")
+        st.info("Todavía no hay leads calificados. Usá el modo uno a uno o el lote.")
 
 
 def tab_dispatch(cfg: dict[str, str]) -> None:
-    st.subheader("🚀 Despacho Outbound (Instantly / Webhook)")
+    st.subheader("🚀 Paso 3 — Despacho Outbound (supervisado)")
     st.write(
-        "Empujá automáticamente los leads **High** (con icebreaker) a Instantly.ai "
-        "o a un webhook de Make/n8n mediante HTTP POST."
+        "Enviá leads High de a uno o el lote aprobado. Cada envío requiere confirmación "
+        "explícita para que puedas supervisar el proceso."
     )
+
+    if not st.session_state.step2_approved:
+        st.warning("Primero aprobá los leads High en **Paso 2 (Scoring)**.")
+        if st.button("Ir a Scoring"):
+            st.session_state.pipeline_step = 2
+            st.rerun()
+        return
 
     high = st.session_state.high_leads
     scored = st.session_state.scored_leads
@@ -1105,68 +1344,173 @@ def tab_dispatch(cfg: dict[str, str]) -> None:
         high = scored[scored["lead_score"] == "High"].copy()
         st.session_state.high_leads = high
 
-    # También permitir tomar High desde CRM
-    crm = load_crm()
-    crm_high = (
-        crm[(crm["lead_score"] == "High") & (crm["pipeline_status"].isin(["Nuevo", ""]))]
-        if not crm.empty
-        else pd.DataFrame()
-    )
+    if not isinstance(high, pd.DataFrame) or high.empty:
+        st.error("No hay leads High para despachar.")
+        return
 
-    source = st.radio(
-        "Origen de leads a despachar",
-        ["Sesión (scoring actual)", "CRM local (High + Nuevo)"],
-        horizontal=True,
+    # Checklist de aprobación individual
+    st.markdown("#### Checklist de envío")
+    approve_df = high.copy()
+    approved_set = set(st.session_state.dispatch_approved_ids or [])
+    approve_df["aprobar_envio"] = approve_df["id"].astype(str).isin(approved_set)
+    edited = st.data_editor(
+        approve_df[
+            [c for c in ["aprobar_envio", "nombre", "website", "lead_score", "icebreaker", "telefono", "id"] if c in approve_df.columns]
+        ],
+        use_container_width=True,
+        hide_index=True,
+        column_config={
+            "aprobar_envio": st.column_config.CheckboxColumn("Aprobar envío", default=True),
+            "website": st.column_config.LinkColumn("Website"),
+            "icebreaker": st.column_config.TextColumn("Icebreaker", width="large"),
+        },
+        disabled=[c for c in approve_df.columns if c not in {"aprobar_envio", "icebreaker"}],
+        key="editor_dispatch_approve",
     )
-    if source.startswith("Sesión"):
-        payload_df = high if isinstance(high, pd.DataFrame) else pd.DataFrame()
-    else:
-        payload_df = crm_high
+    st.session_state.dispatch_approved_ids = (
+        edited[edited["aprobar_envio"] == True]["id"].astype(str).tolist()  # noqa: E712
+    )
+    # Sync icebreaker edits back
+    if "icebreaker" in edited.columns:
+        full_high = high.copy()
+        for _, row in edited.iterrows():
+            mask = full_high["id"].astype(str) == str(row["id"])
+            if mask.any() and "icebreaker" in full_high.columns:
+                full_high.loc[mask, "icebreaker"] = row["icebreaker"]
+        st.session_state.high_leads = full_high
+        high = full_high
 
+    payload = high[high["id"].astype(str).isin(st.session_state.dispatch_approved_ids)].copy()
     m1, m2, m3 = st.columns(3)
-    m1.metric("Leads High listos", len(payload_df) if isinstance(payload_df, pd.DataFrame) else 0)
+    m1.metric("Aprobados para envío", len(payload))
     m2.metric("Instantly key", "OK" if cfg["instantly_key"] else "No")
     m3.metric("Webhook", "OK" if cfg["webhook_url"] else "No")
 
-    mode = st.selectbox("Canal de despacho", ["Instantly.ai", "Webhook (Make/n8n)"])
+    channel = st.selectbox("Canal de despacho", ["Instantly.ai", "Webhook (Make/n8n)"])
+    exec_mode = st.radio(
+        "Modo de ejecución",
+        ["Uno a uno (supervisado)", "Lote aprobado (con confirmación)"],
+        horizontal=True,
+        key="dispatch_mode_radio",
+    )
+    st.session_state.dispatch_mode = exec_mode
 
-    if isinstance(payload_df, pd.DataFrame) and not payload_df.empty:
-        st.dataframe(
-            payload_df[
-                [
-                    c
-                    for c in ["nombre", "website", "lead_score", "icebreaker", "telefono"]
-                    if c in payload_df.columns
-                ]
-            ],
-            use_container_width=True,
-            hide_index=True,
-        )
-    else:
-        st.warning("No hay leads High para despachar. Calificá leads o guardalos en el CRM.")
+    if payload.empty:
+        st.warning("Marcá al menos un lead en **Aprobar envío**.")
+        return
 
-    if st.button("Enviar a Campaña Fría", type="primary", use_container_width=True):
-        if payload_df is None or payload_df.empty:
-            st.error("No hay leads High en el origen seleccionado.")
-        elif mode == "Instantly.ai" and not cfg["instantly_key"]:
-            st.error("Falta Instantly API Key (sidebar o .env).")
-        elif mode == "Webhook (Make/n8n)" and not cfg["webhook_url"]:
-            st.error("Falta URL de webhook (sidebar o .env).")
-        else:
-            logs = dispatch_high_leads(
-                payload_df,
-                mode=mode,
-                instantly_key=cfg["instantly_key"],
-                webhook_url=cfg["webhook_url"],
-                campaign_id=cfg["campaign_id"],
-                calendar_url=cfg["calendar_url"],
+    # ---- Uno a uno ----
+    if exec_mode.startswith("Uno a uno"):
+        queue = st.session_state.dispatch_approved_ids
+        if not st.session_state.dispatch_queue_ids:
+            st.session_state.dispatch_queue_ids = list(queue)
+            st.session_state.dispatch_queue_idx = 0
+        # Refresh queue if approvals changed
+        if set(st.session_state.dispatch_queue_ids) != set(queue):
+            # keep progress on remaining
+            remaining = [i for i in queue if i in set(queue)]
+            st.session_state.dispatch_queue_ids = remaining
+            st.session_state.dispatch_queue_idx = min(
+                st.session_state.dispatch_queue_idx, max(len(remaining) - 1, 0)
             )
-            ok_n = sum(1 for r in logs if r["exito"] == "sí")
-            fail_n = len(logs) - ok_n
-            if ok_n:
-                st.success(f"Despacho finalizado: {ok_n} OK · {fail_n} fallidos.")
+
+        idx = int(st.session_state.dispatch_queue_idx)
+        total_q = len(st.session_state.dispatch_queue_ids)
+        if total_q == 0:
+            st.info("No hay leads en cola de despacho.")
+            return
+        if idx >= total_q:
+            st.success("Cola de despacho finalizada.")
+        else:
+            lead_id = str(st.session_state.dispatch_queue_ids[idx])
+            lead_row = payload[payload["id"].astype(str) == lead_id]
+            if lead_row.empty:
+                st.session_state.dispatch_queue_idx = idx + 1
+                st.rerun()
+            lead = lead_row.iloc[0].to_dict()
+            st.markdown(f"##### Envío {idx + 1} de {total_q}: **{_safe_str(lead.get('nombre'))}**")
+            st.write(
+                {
+                    "website": lead.get("website"),
+                    "telefono": lead.get("telefono"),
+                    "icebreaker": lead.get("icebreaker"),
+                    "lead_score": lead.get("lead_score"),
+                }
+            )
+            confirm_one = st.checkbox(
+                f"Confirmo enviar este lead por {channel}",
+                key=f"confirm_dispatch_{lead_id}",
+            )
+            d1, d2 = st.columns(2)
+            with d1:
+                if st.button(
+                    "Enviar este lead ahora",
+                    type="primary",
+                    use_container_width=True,
+                    disabled=not confirm_one,
+                ):
+                    if channel == "Instantly.ai" and not cfg["instantly_key"]:
+                        st.error("Falta Instantly API Key.")
+                    elif channel == "Webhook (Make/n8n)" and not cfg["webhook_url"]:
+                        st.error("Falta URL de webhook.")
+                    else:
+                        log_row, crm = dispatch_one_lead(
+                            lead,
+                            channel,
+                            cfg["instantly_key"],
+                            cfg["webhook_url"],
+                            cfg["campaign_id"],
+                            cfg["calendar_url"],
+                        )
+                        save_crm(crm)
+                        append_dispatch_log([log_row])
+                        if log_row["exito"] == "sí":
+                            st.success(f"Enviado OK — HTTP {log_row['http_status']}")
+                        else:
+                            st.error(f"Falló — {log_row['detalle'][:200]}")
+                        st.session_state.dispatch_queue_idx = idx + 1
+                        st.rerun()
+            with d2:
+                if st.button("Omitir este lead →", use_container_width=True):
+                    st.session_state.dispatch_queue_idx = idx + 1
+                    st.rerun()
+
+    # ---- Lote ----
+    else:
+        confirm_batch = st.checkbox(
+            f"Confirmo enviar el lote de {len(payload)} lead(s) aprobados por {channel}",
+            key="confirm_dispatch_batch",
+        )
+        if st.button(
+            "Enviar lote aprobado a Campaña Fría",
+            type="primary",
+            use_container_width=True,
+            disabled=not confirm_batch,
+        ):
+            if channel == "Instantly.ai" and not cfg["instantly_key"]:
+                st.error("Falta Instantly API Key.")
+            elif channel == "Webhook (Make/n8n)" and not cfg["webhook_url"]:
+                st.error("Falta URL de webhook.")
             else:
-                st.error(f"Ningún envío exitoso ({fail_n} fallidos). Revisá el log.")
+                logs = dispatch_high_leads(
+                    payload,
+                    mode=channel,
+                    instantly_key=cfg["instantly_key"],
+                    webhook_url=cfg["webhook_url"],
+                    campaign_id=cfg["campaign_id"],
+                    calendar_url=cfg["calendar_url"],
+                )
+                ok_n = sum(1 for r in logs if r["exito"] == "sí")
+                fail_n = len(logs) - ok_n
+                st.session_state.pipeline_step = 4
+                if ok_n:
+                    st.success(f"Despacho finalizado: {ok_n} OK · {fail_n} fallidos. Revisá el CRM.")
+                else:
+                    st.error(f"Ningún envío exitoso ({fail_n} fallidos).")
+
+    if st.button("Marcar paso completado e ir al CRM →", use_container_width=True):
+        st.session_state.pipeline_step = 4
+        st.rerun()
 
     st.markdown("#### Historial / log de envíos")
     log_df = st.session_state.dispatch_log
@@ -1179,6 +1523,7 @@ def tab_dispatch(cfg: dict[str, str]) -> None:
             st.metric("Fallos", int((log_df["exito"] != "sí").sum()))
     else:
         st.caption("Todavía no hay envíos registrados.")
+
 
 
 def tab_crm(cfg: dict[str, str]) -> None:
@@ -1356,9 +1701,6 @@ def tab_crm(cfg: dict[str, str]) -> None:
                     st.rerun()
 
 
-# ---------------------------------------------------------------------------
-# Main
-# ---------------------------------------------------------------------------
 def main() -> None:
     st.set_page_config(
         page_title=APP_TITLE,
@@ -1371,17 +1713,28 @@ def main() -> None:
     st.title("🎯 SDR Autónomo — Panel Unificado")
     st.caption(
         "Katem (katem.com.ar) · Guía Pilar (guia-pilar.com) — "
-        "Sourcing → Scoring IA → Outbound → CRM local"
+        "Pipeline supervisado: Sourcing → Scoring → Outbound → CRM"
     )
 
     cfg = render_sidebar()
+    render_pipeline_stepper()
+
+    # Resaltar la pestaña del paso activo vía caption
+    step = int(st.session_state.get("pipeline_step", 1))
+    step_hints = {
+        1: "Estás en el paso de Sourcing: buscá y aprobá la selección.",
+        2: "Estás en Scoring: calificá de a uno o en lote con confirmación.",
+        3: "Estás en Despacho: enviá leads High con supervisión.",
+        4: "Estás en CRM: actualizá pipeline y exportá.",
+    }
+    st.info(step_hints.get(step, ""))
 
     tab1, tab2, tab3, tab4 = st.tabs(
         [
-            "🔍 Búsqueda de Leads",
-            "🧠 Scoring e Inteligencia",
-            "🚀 Despacho Outbound",
-            "📊 CRM Local",
+            "🔍 1. Sourcing",
+            "🧠 2. Scoring",
+            "🚀 3. Despacho",
+            "📊 4. CRM",
         ]
     )
     with tab1:
@@ -1396,7 +1749,6 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-
 
 # =============================================================================
 # Documentación embebida (asignada a variables para que Streamlit Magic
