@@ -2,7 +2,7 @@
 
 Panel unificado en Streamlit para el ciclo de prospección B2B:
 
-1. Sourcing de leads (Places / SerpAPI / Outscraper / Bright Data / Apollo / Clay / IG-FB / Directorios AR, o simulación)
+1. Sourcing de leads (Places / SerpAPI / Outscraper / Bright Data / Apollo / Clay API directa / IG-FB / Directorios AR, o simulación)
 2. Enrichment (email + LinkedIn) y scrape web → dolores / icebreaker con Claude
 3. Scoring supervisado + despacho outbound (Instantly / webhook)
 4. CRM local con pipeline y exportación CSV/Excel
@@ -18,8 +18,8 @@ Verticales template: directorios locales, B2B servicios, profesionales, retail.
 
 El flujo **no se ejecuta todo junto**: cada etapa tiene una puerta de aprobación.
 
-1. **Sourcing** → Places / SerpAPI / Outscraper / Bright Data / Apollo / Clay / IG-FB / Directorios AR  
-2. **Enrichment** → email (Hunter/Snov/heurística) + LinkedIn vía Clay  
+1. **Sourcing** → Places / SerpAPI / Outscraper / Bright Data / Apollo / **Clay Public API** (table ID + key, sin Make) / IG-FB / Directorios AR  
+2. **Enrichment** → email (Hunter/Snov/heurística) + LinkedIn (webhook opcional)  
 3. **Web / Dolores** → scrape del sitio + dolores/ángulo/icebreaker con Claude (o heurística)  
 4. **Scoring** → uno a uno o lote confirmado (usa dolores del scrape)  
 5. **Despacho** → Instantly / webhook supervisado  
@@ -36,3 +36,11 @@ streamlit run app.py
 ```
 
 Sin API keys la app sigue siendo usable: sourcing simulado, scrape+dolores heurísticos, scoring local y validación de payloads de despacho. Con `ANTHROPIC_API_KEY`, el paso Web/Dolores usa Claude sobre el texto scrapado.
+
+## Clay API directa (sin Make)
+
+1. Creá una **Public API key** en Clay → Settings → Account → API keys.
+2. En la tabla: **Enable for API** (requiere Enterprise para `/tables/query`).
+3. Copiá el table ID de la URL (`/tables/t_…`) a `CLAY_TABLE_ID`.
+4. En el panel: fuente **Clay (API)**; ajustá nombres de columnas en el expander del sidebar si no coinciden con los defaults.
+5. `CLAY_WEBHOOK_URL` queda solo como fallback legado si no hay table ID.

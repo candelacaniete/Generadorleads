@@ -77,7 +77,7 @@ VERTICAL_TEMPLATES: dict[str, dict[str, Any]] = {
             "Directorios AR",
             "Instagram (Meta/local)",
             "Facebook Pages (Meta)",
-            "Clay (webhook)",
+            "Clay (API)",
         ],
         "scoring_hint": "Cliente ideal para directorio local y servicios de presencia digital.",
     },
@@ -85,7 +85,7 @@ VERTICAL_TEMPLATES: dict[str, dict[str, Any]] = {
         "label": "B2B servicios / agencias",
         "default_nicho": "agencias de marketing",
         "default_ubicacion": "Argentina",
-        "fuentes": ["Apollo.io", "Clay (webhook)", "Google Places", "SerpAPI Maps", "Bright Data Maps"],
+        "fuentes": ["Apollo.io", "Clay (API)", "Google Places", "SerpAPI Maps", "Bright Data Maps"],
         "scoring_hint": "Cliente ideal para automatización SDR, outbound y growth B2B.",
     },
     "profesionales": {
@@ -97,7 +97,7 @@ VERTICAL_TEMPLATES: dict[str, dict[str, Any]] = {
             "Doctoralia",
             "Instagram (Meta/local)",
             "Facebook Pages (Meta)",
-            "Clay (webhook)",
+            "Clay (API)",
         ],
         "scoring_hint": "Cliente ideal para captación de pacientes y reputación online.",
     },
@@ -111,11 +111,13 @@ VERTICAL_TEMPLATES: dict[str, dict[str, Any]] = {
             "Mercado Libre Servicios",
             "PedidosYa Partners",
             "Instagram (Meta/local)",
-            "Clay (webhook)",
+            "Clay (API)",
         ],
         "scoring_hint": "Cliente ideal para performance ads, CRM y recuperación de carrito.",
     },
 }
+
+CLAY_TABLES_QUERY_URL = "https://api.clay.com/public/v0/tables/query"
 
 DEFAULT_CLIENTS: dict[str, dict[str, Any]] = {
     "katem-demo": {
@@ -854,8 +856,53 @@ def _clay_response_preview(resp: httpx.Response, limit: int = 280) -> str:
     return body
 
 
+def _clay_cell_value(raw: Any) -> Any:
+    """Desenvuelve celdas Clay Public API `{status, value, fields}`."""
+    if isinstance(raw, dict) and "status" in raw:
+        status = str(raw.get("status") or "").lower()
+        if status in {
+            "empty",
+            "error",
+            "running",
+            "queued",
+            "retry",
+            "rate_limited",
+            "awaiting_callback",
+        }:
+            return ""
+        if "value" in raw:
+            return raw.get("value")
+    return raw
+
+
+def _clay_as_text(raw: Any) -> str:
+    val = _clay_cell_value(raw)
+    if val is None:
+        return ""
+    if isinstance(val, (list, tuple)):
+        parts = [_safe_str(_clay_cell_value(x)) for x in val]
+        return ", ".join(p for p in parts if p)
+    if isinstance(val, dict):
+        for k in ("url", "href", "text", "name", "label", "domain", "value"):
+            if val.get(k) not in (None, ""):
+                return _safe_str(val.get(k))
+        return _safe_str(val)
+    return _safe_str(val)
+
+
+def _clay_normalize_website(raw: str) -> str:
+    w = _safe_str(raw).strip()
+    if not w:
+        return ""
+    if w.startswith(("http://", "https://")):
+        return w
+    if "." in w and " " not in w:
+        return f"https://{w.lstrip('/')}"
+    return w
+
+
 def _parse_clay_leads_payload(payload: Any, nicho: str, ubicacion: str, fuente: str) -> list[dict[str, Any]]:
-    """Normaliza respuestas típicas de Clay/Make/n8n (lista, {leads|rows|results|data})."""
+    """Normaliza respuestas Clay Public API / Make/n8n (lista, {leads|rows|results|data})."""
     items: list[Any]
     if isinstance(payload, list):
         items = payload
@@ -908,17 +955,28 @@ def _parse_clay_leads_payload(payload: Any, nicho: str, ubicacion: str, fuente: 
     for item in items:
         if not isinstance(item, dict):
             continue
+        # Clay API: fila = mapa alias→CellResult. Make: fields/cells/properties o plano.
         fields = item.get("fields") or item.get("cells") or item.get("properties") or item
         if not isinstance(fields, dict):
             continue
+        # Si "fields" es metadata de schema Clay (id/name/type), usar la fila cruda
+        sample_vals = list(fields.values())[:3]
+        if sample_vals and all(
+            isinstance(v, dict) and set(v.keys()) <= {"id", "name", "type"} for v in sample_vals
+        ):
+            fields = item
 
         def pick(*keys: str) -> str:
             for k in keys:
-                if k in fields and fields.get(k) not in (None, ""):
-                    return _safe_str(fields.get(k))
+                if k in fields:
+                    text = _clay_as_text(fields.get(k))
+                    if text:
+                        return text
                 for fk, fv in fields.items():
-                    if str(fk).lower() == k.lower() and fv not in (None, ""):
-                        return _safe_str(fv)
+                    if str(fk).lower() == k.lower():
+                        text = _clay_as_text(fv)
+                        if text:
+                            return text
             return ""
 
         nombre = pick(
@@ -933,21 +991,36 @@ def _parse_clay_leads_payload(payload: Any, nicho: str, ubicacion: str, fuente: 
         )
         if not nombre:
             continue
+        # Evitar tomar el status de CellResult como Status de negocio
+        status_biz = pick("Status")
+        if status_biz.lower() in {
+            "success",
+            "empty",
+            "error",
+            "running",
+            "queued",
+            "retry",
+            "rate_limited",
+            "awaiting_callback",
+        }:
+            status_biz = ""
         rows.append(
             _normalize_lead_row(
                 nombre=nombre,
                 direccion=pick("direccion", "address", "Address", "location", "full_address"),
                 telefono=pick("telefono", "phone", "Phone", "mobile", "Mobile Phone"),
-                website=pick(
-                    "website",
-                    "domain",
-                    "Website",
-                    "url",
-                    "Company Domain",
-                    "company_domain",
+                website=_clay_normalize_website(
+                    pick(
+                        "website",
+                        "domain",
+                        "Website",
+                        "url",
+                        "Company Domain",
+                        "company_domain",
+                    )
                 ),
                 rating=pick("rating", "score", "employee_count", "Employees"),
-                status_places=pick("status", "Status") or "CLAY",
+                status_places=status_biz or "CLAY",
                 rubro=nicho,
                 ubicacion=ubicacion or pick("ubicacion", "city", "City", "location"),
                 email=pick("email", "Email", "work_email", "Work Email"),
@@ -964,34 +1037,177 @@ def _parse_clay_leads_payload(payload: Any, nicho: str, ubicacion: str, fuente: 
     return rows
 
 
-def search_clay_leads(
+def _clay_build_table_query(
+    table_id: str,
+    cantidad: int,
+    nicho: str,
+    ubicacion: str,
+    field_company: str,
+    field_domain: str,
+    field_phone: str,
+    field_address: str,
+    field_email: str,
+    field_linkedin: str,
+    filter_nicho_field: str,
+    filter_ubicacion_field: str,
+) -> dict[str, Any]:
+    """Arma el body POST /tables/query de Clay Public API."""
+    select: list[dict[str, str]] = []
+    mapping = [
+        (field_company, "company_name"),
+        (field_domain, "domain"),
+        (field_phone, "phone"),
+        (field_address, "address"),
+        (field_email, "email"),
+        (field_linkedin, "linkedin"),
+    ]
+    seen: set[str] = set()
+    for field_name, alias in mapping:
+        name = (field_name or "").strip()
+        if not name or name.lower() in seen:
+            continue
+        seen.add(name.lower())
+        select.append({"field": name, "as": alias})
+    if not select:
+        select = [{"field": "Company Name", "as": "company_name"}]
+
+    predicates: list[dict[str, Any]] = []
+    company_field = (field_company or "Company Name").strip() or "Company Name"
+    predicates.append({"field": company_field, "op": "is_not_empty"})
+    nicho_f = (filter_nicho_field or "").strip()
+    ubi_f = (filter_ubicacion_field or "").strip()
+    if nicho_f and nicho.strip():
+        predicates.append({"field": nicho_f, "op": "contains", "value": nicho.strip()})
+    if ubi_f and ubicacion.strip():
+        predicates.append({"field": ubi_f, "op": "contains", "value": ubicacion.strip()})
+
+    filt: dict[str, Any]
+    if len(predicates) == 1:
+        filt = predicates[0]
+    else:
+        filt = {"and": predicates}
+
+    return {
+        "query": {
+            "tables": [{"id": table_id.strip()}],
+            "select": select,
+            "filter": filt,
+            "field_mode": "names",
+        },
+        "limit": max(1, min(int(cantidad), 100)),
+    }
+
+
+def _search_clay_api_direct(
+    nicho: str,
+    ubicacion: str,
+    cantidad: int,
+    api_key: str,
+    table_id: str,
+    field_company: str,
+    field_domain: str,
+    field_phone: str,
+    field_address: str,
+    field_email: str,
+    field_linkedin: str,
+    filter_nicho_field: str,
+    filter_ubicacion_field: str,
+) -> tuple[pd.DataFrame, str]:
+    """Lee leads desde Clay Public Tables API (Enterprise)."""
+    headers = {
+        "Content-Type": "application/json",
+        "Accept": "application/json",
+        "clay-api-key": api_key.strip(),
+    }
+    body = _clay_build_table_query(
+        table_id,
+        cantidad,
+        nicho,
+        ubicacion,
+        field_company,
+        field_domain,
+        field_phone,
+        field_address,
+        field_email,
+        field_linkedin,
+        filter_nicho_field,
+        filter_ubicacion_field,
+    )
+    try:
+        resp = httpx.post(CLAY_TABLES_QUERY_URL, headers=headers, json=body, timeout=60.0)
+        if resp.status_code >= 400:
+            tip = ""
+            if resp.status_code == 401:
+                tip = " API key inválida — usá Public API key (Settings → Account → API keys)."
+            elif resp.status_code == 403:
+                tip = " Tables query requiere plan Enterprise + Enable for API en la tabla."
+            elif resp.status_code == 404:
+                tip = " Table ID incorrecto o sin acceso."
+            elif resp.status_code == 400:
+                tip = " Revisá nombres de columnas (deben coincidir exactamente con Clay)."
+            st.warning(
+                f"Clay API HTTP {resp.status_code}.{tip} "
+                f"Preview: `{_clay_response_preview(resp)}`. Usando simulación."
+            )
+            with st.expander("Detalle Clay API", expanded=False):
+                st.code(
+                    f"POST {CLAY_TABLES_QUERY_URL}\n"
+                    f"table_id={table_id}\n"
+                    f"HTTP {resp.status_code}\n"
+                    f"Body:\n{_clay_response_preview(resp, 1200)}"
+                )
+                st.json(body)
+            return (
+                _mock_places_leads(nicho, ubicacion, cantidad, "clay_api_simulado_fallback"),
+                "clay_api_simulado_fallback",
+            )
+
+        payload, reason = _coerce_http_json(resp)
+        if payload is None:
+            st.warning(
+                f"Clay API no devolvió JSON usable (`{reason}`). "
+                f"Preview: `{_clay_response_preview(resp)}`"
+            )
+            return (
+                _mock_places_leads(nicho, ubicacion, cantidad, f"clay_api_simulado_{reason}"),
+                f"clay_api_simulado_{reason}",
+            )
+
+        rows = _parse_clay_leads_payload(payload, nicho, ubicacion, "clay_api")
+        if not rows:
+            st.warning(
+                "Clay API respondió OK pero sin filas parseables. "
+                "Verificá Enable for API, filtros nicho/ubicación y nombres de columnas."
+            )
+            with st.expander("JSON Clay API", expanded=False):
+                st.json(payload if isinstance(payload, dict) else payload[:20])
+            return (
+                _mock_places_leads(nicho, ubicacion, cantidad, "clay_api_simulado_vacio"),
+                "clay_api_simulado_vacio",
+            )
+        return pd.DataFrame(rows[:cantidad]), "clay_api"
+    except Exception as exc:  # noqa: BLE001
+        st.error(f"Error Clay API directa: {exc}")
+        return (
+            _mock_places_leads(nicho, ubicacion, cantidad, "clay_api_simulado_error"),
+            "clay_api_simulado_error",
+        )
+
+
+def _search_clay_webhook(
     nicho: str,
     ubicacion: str,
     cantidad: int,
     api_key: str,
     webhook_url: str,
 ) -> tuple[pd.DataFrame, str]:
-    """
-    Fuente Clay vía webhook (idealmente Make/n8n que lea Clay y responda JSON).
-
-    El *Monitor webhook* nativo de Clay solo RECIBE filas hacia Clay y suele
-    responder vacío/HTML/ACK — no devuelve leads. Para sourcing síncrono usá
-    Make/n8n/Zapier que consulte Clay y responda JSON con leads.
-    """
-    if not webhook_url:
-        return (
-            _mock_places_leads(nicho, ubicacion, cantidad, "clay_simulado"),
-            "clay_simulado",
-        )
-
+    """Fallback opcional: webhook Make/n8n que responda JSON con leads."""
     problem = _webhook_url_problem(webhook_url)
     webhook_url = _normalize_webhook_url(webhook_url)
     if problem or not webhook_url:
         st.warning(
             f"Webhook Clay/Make inválido ({problem or 'URL vacía'}). "
-            "No uses la URL de Streamlit (`*.streamlit.app/.../webhook`). "
-            "Creá un escenario Make/n8n con su propia URL que lea Clay y responda "
-            "`{leads:[{nombre,website,...}]}`."
+            "Preferí Clay API directa (table ID + public API key)."
         )
         return (
             _mock_places_leads(nicho, ubicacion, cantidad, "clay_simulado_url_invalida"),
@@ -1034,8 +1250,8 @@ def search_clay_leads(
         if payload is None:
             tip = (
                 "El Monitor webhook de Clay **no devuelve leads** (solo ACK). "
-                "Usá un webhook **Make/n8n** que lea la tabla Clay y responda "
-                "`{leads:[{nombre,website,email,linkedin,...}]}`."
+                "Usá Clay API directa (table ID) o Make/n8n que responda "
+                "`{leads:[{nombre,website,...}]}`."
                 if reason in {"cuerpo_vacio", "ack_sin_leads", "html_no_json"}
                 else "La URL debe responder JSON con leads."
             )
@@ -1058,8 +1274,7 @@ def search_clay_leads(
         if not rows:
             st.warning(
                 "El webhook respondió JSON pero **sin filas de leads parseables**. "
-                "Esperado: `[{nombre, website, ...}]` o `{leads|rows|results: [...]}`. "
-                "Si usás Monitor webhook de Clay, cambiá a Make/n8n que exporte la tabla."
+                "Esperado: `[{nombre, website, ...}]` o `{leads|rows|results: [...]}`."
             )
             with st.expander("JSON recibido", expanded=False):
                 preview = payload[:20] if isinstance(payload, list) else payload
@@ -1068,14 +1283,79 @@ def search_clay_leads(
                 _mock_places_leads(nicho, ubicacion, cantidad, "clay_simulado_vacio"),
                 "clay_simulado_vacio",
             )
-        return pd.DataFrame(rows[:cantidad]), "clay"
+        return pd.DataFrame(rows[:cantidad]), "clay_webhook"
 
     except Exception as exc:  # noqa: BLE001
-        st.error(f"Error consultando Clay/Make: {exc}")
+        st.error(f"Error consultando Clay/Make webhook: {exc}")
         return (
             _mock_places_leads(nicho, ubicacion, cantidad, "clay_simulado_error"),
             "clay_simulado_error",
         )
+
+
+def search_clay_leads(
+    nicho: str,
+    ubicacion: str,
+    cantidad: int,
+    api_key: str,
+    table_id: str = "",
+    webhook_url: str = "",
+    field_company: str = "Company Name",
+    field_domain: str = "Domain",
+    field_phone: str = "Phone",
+    field_address: str = "Address",
+    field_email: str = "Email",
+    field_linkedin: str = "LinkedIn URL",
+    filter_nicho_field: str = "",
+    filter_ubicacion_field: str = "",
+) -> tuple[pd.DataFrame, str]:
+    """
+    Fuente Clay: prioriza Public Tables API directa (sin Make).
+
+    Requiere Public API key + table ID (Enterprise, Enable for API).
+    Webhook Make/n8n queda como fallback opcional si no hay table ID.
+    """
+    tid = (table_id or "").strip()
+    key = (api_key or "").strip()
+    if tid and key:
+        return _search_clay_api_direct(
+            nicho,
+            ubicacion,
+            cantidad,
+            key,
+            tid,
+            field_company,
+            field_domain,
+            field_phone,
+            field_address,
+            field_email,
+            field_linkedin,
+            filter_nicho_field,
+            filter_ubicacion_field,
+        )
+    if tid and not key:
+        st.warning(
+            "Clay Table ID configurado pero falta **Public API key** "
+            "(Settings → Account → API keys). Usando simulación."
+        )
+        return (
+            _mock_places_leads(nicho, ubicacion, cantidad, "clay_api_simulado_sin_key"),
+            "clay_api_simulado_sin_key",
+        )
+    if (webhook_url or "").strip():
+        st.info("Sin Table ID: usando webhook Clay/Make (legado). Preferí API directa.")
+        return _search_clay_webhook(nicho, ubicacion, cantidad, key, webhook_url)
+
+    st.warning(
+        "Clay API directa: cargá **CLAY_API_KEY** + **CLAY_TABLE_ID** "
+        "(URL Clay → `/tables/t_…`). Sin eso → simulación."
+    )
+    return (
+        _mock_places_leads(nicho, ubicacion, cantidad, "clay_simulado"),
+        "clay_simulado",
+    )
+
+
 
 
 
@@ -1501,7 +1781,16 @@ def search_leads(
             ubicacion,
             cantidad,
             cfg.get("clay_key", ""),
-            cfg.get("clay_webhook_url", ""),
+            table_id=cfg.get("clay_table_id", ""),
+            webhook_url=cfg.get("clay_webhook_url", ""),
+            field_company=cfg.get("clay_field_company", "Company Name"),
+            field_domain=cfg.get("clay_field_domain", "Domain"),
+            field_phone=cfg.get("clay_field_phone", "Phone"),
+            field_address=cfg.get("clay_field_address", "Address"),
+            field_email=cfg.get("clay_field_email", "Email"),
+            field_linkedin=cfg.get("clay_field_linkedin", "LinkedIn URL"),
+            filter_nicho_field=cfg.get("clay_filter_nicho", ""),
+            filter_ubicacion_field=cfg.get("clay_filter_ubicacion", ""),
         )
     if source_norm.startswith("serpapi"):
         return search_serpapi_maps(nicho, ubicacion, cantidad, cfg.get("serpapi_key", ""))
@@ -2878,17 +3167,57 @@ def render_sidebar() -> dict[str, str]:
         ),
     )
     clay_key = st.sidebar.text_input(
-        "Clay API Key",
+        "Clay Public API Key",
         value=env_or_secret("CLAY_API_KEY"),
         type="password",
+        help="Settings → Account → API keys (beta). Header clay-api-key.",
     )
+    clay_table_id = st.sidebar.text_input(
+        "Clay Table ID",
+        value=env_or_secret("CLAY_TABLE_ID"),
+        help="De la URL Clay: /tables/t_…. Requiere Enable for API + Enterprise.",
+    )
+    with st.sidebar.expander("Clay columnas / filtros", expanded=False):
+        clay_field_company = st.text_input(
+            "Columna empresa",
+            value=env_or_secret("CLAY_FIELD_COMPANY", "Company Name"),
+        )
+        clay_field_domain = st.text_input(
+            "Columna dominio/web",
+            value=env_or_secret("CLAY_FIELD_DOMAIN", "Domain"),
+        )
+        clay_field_phone = st.text_input(
+            "Columna teléfono",
+            value=env_or_secret("CLAY_FIELD_PHONE", "Phone"),
+        )
+        clay_field_address = st.text_input(
+            "Columna dirección",
+            value=env_or_secret("CLAY_FIELD_ADDRESS", "Address"),
+        )
+        clay_field_email = st.text_input(
+            "Columna email",
+            value=env_or_secret("CLAY_FIELD_EMAIL", "Email"),
+        )
+        clay_field_linkedin = st.text_input(
+            "Columna LinkedIn",
+            value=env_or_secret("CLAY_FIELD_LINKEDIN", "LinkedIn URL"),
+        )
+        clay_filter_nicho = st.text_input(
+            "Filtrar nicho en columna (opcional)",
+            value=env_or_secret("CLAY_FILTER_NICHO_FIELD"),
+            help="Ej. Industry / Rubro. Vacío = sin filtro por nicho.",
+        )
+        clay_filter_ubicacion = st.text_input(
+            "Filtrar ubicación en columna (opcional)",
+            value=env_or_secret("CLAY_FILTER_UBICACION_FIELD"),
+            help="Ej. City / Location. Vacío = sin filtro por ubicación.",
+        )
     clay_webhook_url = st.sidebar.text_input(
-        "Clay / Make webhook (sourcing)",
+        "Clay webhook (opcional / legado)",
         value=env_or_secret("CLAY_WEBHOOK_URL"),
         help=(
-            "URL de Make/n8n (ej. https://hook.eu1.make.com/...). "
-            "NO pongas la URL de Streamlit. "
-            "Monitor Clay nativo solo ACK — no sirve."
+            "Solo si no usás Table ID. Make/n8n que responda JSON leads. "
+            "La API directa no necesita esto."
         ),
     )
     serpapi_key = st.sidebar.text_input(
@@ -2972,7 +3301,16 @@ def render_sidebar() -> dict[str, str]:
         "google_key": google_key.strip(),
         "apollo_key": apollo_key.strip(),
         "clay_key": clay_key.strip(),
+        "clay_table_id": clay_table_id.strip(),
         "clay_webhook_url": clay_webhook_url.strip(),
+        "clay_field_company": clay_field_company.strip() or "Company Name",
+        "clay_field_domain": clay_field_domain.strip() or "Domain",
+        "clay_field_phone": clay_field_phone.strip() or "Phone",
+        "clay_field_address": clay_field_address.strip() or "Address",
+        "clay_field_email": clay_field_email.strip() or "Email",
+        "clay_field_linkedin": clay_field_linkedin.strip() or "LinkedIn URL",
+        "clay_filter_nicho": clay_filter_nicho.strip(),
+        "clay_filter_ubicacion": clay_filter_ubicacion.strip(),
         "serpapi_key": serpapi_key.strip(),
         "outscraper_key": outscraper_key.strip(),
         "brightdata_token": brightdata_token.strip(),
@@ -3088,7 +3426,7 @@ def tab_sourcing(cfg: dict[str, str]) -> None:
                 "Outscraper Maps",
                 "Bright Data Maps",
                 "Apollo.io",
-                "Clay (webhook)",
+                "Clay (API)",
                 "Instagram (Meta/local)",
                 "Facebook Pages (Meta)",
                 "Directorios AR",
@@ -3101,7 +3439,7 @@ def tab_sourcing(cfg: dict[str, str]) -> None:
             ],
             help=(
                 "Maps: Places / SerpAPI / Outscraper / Bright Data. "
-                "B2B: Apollo / Clay. Social: Instagram/Facebook. "
+                "B2B: Apollo / Clay API. Social: Instagram/Facebook. "
                 "AR: Cuitonline, GuiaBancos, Páginas Amarillas, ML Servicios, Doctoralia, PedidosYa."
             ),
         )
@@ -3123,9 +3461,10 @@ def tab_sourcing(cfg: dict[str, str]) -> None:
 
         if fuente.startswith("Clay"):
             st.caption(
-                "Clay vía Make/n8n: POST `{nicho, ubicacion, cantidad}` → "
-                "JSON `{leads:[{nombre, website, email, linkedin, ...}]}`. "
-                "Monitor webhook nativo de Clay solo ACK → cae a simulación."
+                "Clay Public API directa: `CLAY_API_KEY` + `CLAY_TABLE_ID` "
+                "(Enterprise + Enable for API). Sin Make. "
+                "Ajustá nombres de columnas en el expander del sidebar. "
+                "Webhook legado solo si no hay Table ID."
             )
         elif fuente.startswith("Apollo"):
             st.caption(
