@@ -63,28 +63,49 @@ VERTICAL_TEMPLATES: dict[str, dict[str, Any]] = {
         "label": "Directorios / comercios locales",
         "default_nicho": "comercios y servicios locales",
         "default_ubicacion": "Pilar",
-        "fuentes": ["Google Places", "Clay (webhook)", "CSV"],
+        "fuentes": [
+            "Google Places",
+            "SerpAPI Maps",
+            "Outscraper Maps",
+            "Directorios AR",
+            "Instagram (Meta/local)",
+            "Facebook Pages (Meta)",
+            "Clay (webhook)",
+        ],
         "scoring_hint": "Cliente ideal para directorio local y servicios de presencia digital.",
     },
     "b2b_servicios": {
         "label": "B2B servicios / agencias",
         "default_nicho": "agencias de marketing",
         "default_ubicacion": "Argentina",
-        "fuentes": ["Apollo.io", "Clay (webhook)", "Google Places"],
+        "fuentes": ["Apollo.io", "Clay (webhook)", "Google Places", "SerpAPI Maps", "Bright Data Maps"],
         "scoring_hint": "Cliente ideal para automatización SDR, outbound y growth B2B.",
     },
     "profesionales": {
         "label": "Profesionales / clínicas",
         "default_nicho": "clínicas y profesionales de la salud",
         "default_ubicacion": "Zona Norte GBA",
-        "fuentes": ["Google Places", "Clay (webhook)"],
+        "fuentes": [
+            "Google Places",
+            "Doctoralia",
+            "Instagram (Meta/local)",
+            "Facebook Pages (Meta)",
+            "Clay (webhook)",
+        ],
         "scoring_hint": "Cliente ideal para captación de pacientes y reputación online.",
     },
     "retail": {
         "label": "Retail / e-commerce",
         "default_nicho": "tiendas y e-commerce",
         "default_ubicacion": "Buenos Aires",
-        "fuentes": ["Google Places", "Apollo.io", "Clay (webhook)"],
+        "fuentes": [
+            "Google Places",
+            "SerpAPI Maps",
+            "Mercado Libre Servicios",
+            "PedidosYa Partners",
+            "Instagram (Meta/local)",
+            "Clay (webhook)",
+        ],
         "scoring_hint": "Cliente ideal para performance ads, CRM y recuperación de carrito.",
     },
 }
@@ -806,6 +827,398 @@ def search_clay_leads(
         )
 
 
+
+# ---------------------------------------------------------------------------
+# Maps alternativos: SerpAPI / Outscraper / Bright Data
+# ---------------------------------------------------------------------------
+def search_serpapi_maps(
+    nicho: str,
+    ubicacion: str,
+    cantidad: int,
+    api_key: str,
+) -> tuple[pd.DataFrame, str]:
+    """Google Maps vía SerpAPI (engine=google_maps)."""
+    if not api_key:
+        return _mock_places_leads(nicho, ubicacion, cantidad, "serpapi_simulado"), "serpapi_simulado"
+
+    query = f"{nicho} {ubicacion}".strip()
+    url = "https://serpapi.com/search.json"
+    params = {
+        "engine": "google_maps",
+        "q": query,
+        "type": "search",
+        "hl": "es",
+        "api_key": api_key,
+    }
+    try:
+        resp = httpx.get(url, params=params, timeout=45.0)
+        if resp.status_code >= 400:
+            st.warning(f"SerpAPI HTTP {resp.status_code}. Usando simulación.")
+            return _mock_places_leads(nicho, ubicacion, cantidad, "serpapi_fallback"), "serpapi_fallback"
+        payload = resp.json()
+        results = payload.get("local_results") or payload.get("place_results") or []
+        if isinstance(results, dict):
+            results = [results]
+        rows: list[dict[str, Any]] = []
+        for item in results[:cantidad]:
+            rows.append(
+                _normalize_lead_row(
+                    nombre=_safe_str(item.get("title") or item.get("name")),
+                    direccion=_safe_str(item.get("address")),
+                    telefono=_safe_str(item.get("phone")),
+                    website=_safe_str(item.get("website") or item.get("link")),
+                    rating=_safe_str(item.get("rating")),
+                    status_places="SERPAPI",
+                    rubro=nicho,
+                    ubicacion=ubicacion,
+                    email="",
+                    linkedin="",
+                    fuente="serpapi_maps",
+                )
+            )
+        if not rows:
+            return _mock_places_leads(nicho, ubicacion, cantidad, "serpapi_vacio"), "serpapi_vacio"
+        return pd.DataFrame(rows), "serpapi_maps"
+    except Exception as exc:  # noqa: BLE001
+        st.error(f"Error SerpAPI: {exc}")
+        return _mock_places_leads(nicho, ubicacion, cantidad, "serpapi_error"), "serpapi_error"
+
+
+def search_outscraper_maps(
+    nicho: str,
+    ubicacion: str,
+    cantidad: int,
+    api_key: str,
+) -> tuple[pd.DataFrame, str]:
+    """Google Maps vía Outscraper Maps Search API."""
+    if not api_key:
+        return _mock_places_leads(nicho, ubicacion, cantidad, "outscraper_simulado"), "outscraper_simulado"
+
+    query = f"{nicho} {ubicacion}".strip()
+    url = "https://api.app.outscraper.com/maps/search-v3"
+    headers = {"X-API-KEY": api_key}
+    params = {"query": query, "limit": min(int(cantidad), 100), "language": "es", "region": "AR"}
+    try:
+        resp = httpx.get(url, headers=headers, params=params, timeout=60.0)
+        if resp.status_code >= 400:
+            st.warning(f"Outscraper HTTP {resp.status_code}. Usando simulación.")
+            return _mock_places_leads(nicho, ubicacion, cantidad, "outscraper_fallback"), "outscraper_fallback"
+        payload = resp.json()
+        # Outscraper suele devolver [[...results]] o {"data": [[...]]}
+        data = payload.get("data") if isinstance(payload, dict) else payload
+        flat: list[Any] = []
+        if isinstance(data, list):
+            for block in data:
+                if isinstance(block, list):
+                    flat.extend(block)
+                elif isinstance(block, dict):
+                    flat.append(block)
+        rows: list[dict[str, Any]] = []
+        for item in flat[:cantidad]:
+            if not isinstance(item, dict):
+                continue
+            rows.append(
+                _normalize_lead_row(
+                    nombre=_safe_str(item.get("name") or item.get("title")),
+                    direccion=_safe_str(item.get("full_address") or item.get("address")),
+                    telefono=_safe_str(item.get("phone")),
+                    website=_safe_str(item.get("site") or item.get("website")),
+                    rating=_safe_str(item.get("rating")),
+                    status_places="OUTSCRAPER",
+                    rubro=nicho,
+                    ubicacion=ubicacion,
+                    email=_safe_str(item.get("email")),
+                    linkedin="",
+                    fuente="outscraper_maps",
+                )
+            )
+        if not rows:
+            return _mock_places_leads(nicho, ubicacion, cantidad, "outscraper_vacio"), "outscraper_vacio"
+        return pd.DataFrame(rows), "outscraper_maps"
+    except Exception as exc:  # noqa: BLE001
+        st.error(f"Error Outscraper: {exc}")
+        return _mock_places_leads(nicho, ubicacion, cantidad, "outscraper_error"), "outscraper_error"
+
+
+def search_brightdata_maps(
+    nicho: str,
+    ubicacion: str,
+    cantidad: int,
+    api_token: str,
+    dataset_url: str,
+) -> tuple[pd.DataFrame, str]:
+    """
+    Google Maps vía Bright Data (dataset/collector HTTP).
+    Espera BRIGHTDATA_TOKEN + BRIGHTDATA_MAPS_URL (endpoint del collector).
+    Body: {query, limit, country}.
+    """
+    if not api_token or not dataset_url:
+        return _mock_places_leads(nicho, ubicacion, cantidad, "brightdata_simulado"), "brightdata_simulado"
+
+    headers = {
+        "Authorization": f"Bearer {api_token}",
+        "Content-Type": "application/json",
+    }
+    body = {
+        "query": f"{nicho} {ubicacion}",
+        "nicho": nicho,
+        "ubicacion": ubicacion,
+        "limit": int(cantidad),
+        "country": "AR",
+        "source": "katem_sdr",
+    }
+    try:
+        resp = httpx.post(dataset_url, headers=headers, json=body, timeout=90.0)
+        if resp.status_code >= 400:
+            st.warning(f"Bright Data HTTP {resp.status_code}. Usando simulación.")
+            return _mock_places_leads(nicho, ubicacion, cantidad, "brightdata_fallback"), "brightdata_fallback"
+        payload = resp.json()
+        items = payload if isinstance(payload, list) else (
+            payload.get("results") or payload.get("data") or payload.get("leads") or []
+        )
+        rows: list[dict[str, Any]] = []
+        for item in items[:cantidad]:
+            if not isinstance(item, dict):
+                continue
+            rows.append(
+                _normalize_lead_row(
+                    nombre=_safe_str(item.get("name") or item.get("title") or item.get("nombre")),
+                    direccion=_safe_str(item.get("address") or item.get("direccion")),
+                    telefono=_safe_str(item.get("phone") or item.get("telefono")),
+                    website=_safe_str(item.get("website") or item.get("url")),
+                    rating=_safe_str(item.get("rating")),
+                    status_places="BRIGHTDATA",
+                    rubro=nicho,
+                    ubicacion=ubicacion,
+                    email=_safe_str(item.get("email")),
+                    linkedin=_safe_str(item.get("linkedin")),
+                    fuente="brightdata_maps",
+                )
+            )
+        if not rows:
+            return _mock_places_leads(nicho, ubicacion, cantidad, "brightdata_vacio"), "brightdata_vacio"
+        return pd.DataFrame(rows), "brightdata_maps"
+    except Exception as exc:  # noqa: BLE001
+        st.error(f"Error Bright Data: {exc}")
+        return _mock_places_leads(nicho, ubicacion, cantidad, "brightdata_error"), "brightdata_error"
+
+
+# ---------------------------------------------------------------------------
+# Social: Instagram / Facebook Graph (páginas locales)
+# ---------------------------------------------------------------------------
+def _mock_social_leads(nicho: str, ubicacion: str, cantidad: int, red: str) -> pd.DataFrame:
+    city = ubicacion or "Pilar"
+    niches = nicho or "negocios locales"
+    slug = re.sub(r"[^a-z0-9]+", "", niches.lower())[:12] or "local"
+    rows = []
+    for i in range(cantidad):
+        handle = f"{slug}{city.lower().replace(' ', '')}{i+1}"
+        if red == "instagram":
+            web = f"https://instagram.com/{handle}"
+            fuente = "instagram_simulado"
+        else:
+            web = f"https://facebook.com/{handle}"
+            fuente = "facebook_simulado"
+        rows.append(
+            _normalize_lead_row(
+                nombre=f"{niches.title()} {city} {i+1}",
+                direccion=f"{city}, Buenos Aires, Argentina",
+                telefono=f"+54 11 4{200+i:03d}-{3000+i:04d}" if i % 2 == 0 else "",
+                website=web,
+                rating=str(round(4.0 + (i % 10) / 10, 1)),
+                status_places=red.upper(),
+                rubro=niches,
+                ubicacion=city,
+                email="",
+                linkedin="",
+                fuente=fuente,
+            )
+        )
+    return pd.DataFrame(rows)
+
+
+def search_meta_pages(
+    nicho: str,
+    ubicacion: str,
+    cantidad: int,
+    access_token: str,
+    network: str = "facebook",
+) -> tuple[pd.DataFrame, str]:
+    """
+    Páginas locales vía Facebook Graph API (pages/search).
+    Para Instagram usa el mismo token (páginas vinculadas) o cae a simulación.
+    """
+    red = "instagram" if network.lower().startswith("insta") else "facebook"
+    if not access_token:
+        return _mock_social_leads(nicho, ubicacion, cantidad, red), f"{red}_simulado"
+
+    if red == "instagram":
+        # Graph no expone búsqueda pública IG Business fácil: usar pages y marcar fuente IG
+        # o webhook; aquí intentamos pages/search y etiquetamos instagram si hay ig handle.
+        pass
+
+    url = "https://graph.facebook.com/v19.0/pages/search"
+    params = {
+        "q": f"{nicho} {ubicacion}",
+        "type": "page",
+        "fields": "id,name,location,phone,website,link,overall_star_rating,category",
+        "limit": min(int(cantidad), 25),
+        "access_token": access_token,
+    }
+    try:
+        resp = httpx.get(url, params=params, timeout=40.0)
+        if resp.status_code >= 400:
+            st.warning(f"Meta Graph HTTP {resp.status_code}. Usando simulación {red}.")
+            return _mock_social_leads(nicho, ubicacion, cantidad, red), f"{red}_fallback"
+        payload = resp.json()
+        data = payload.get("data") or []
+        rows: list[dict[str, Any]] = []
+        for item in data[:cantidad]:
+            loc = item.get("location") or {}
+            direccion = ", ".join(
+                [
+                    _safe_str(loc.get("street")),
+                    _safe_str(loc.get("city")),
+                    _safe_str(loc.get("state")),
+                    _safe_str(loc.get("country")),
+                ]
+            ).strip(", ")
+            website = _safe_str(item.get("website") or item.get("link"))
+            if red == "instagram" and website and "instagram.com" not in website:
+                # si no hay IG explícito, dejamos fanpage como website
+                pass
+            rows.append(
+                _normalize_lead_row(
+                    nombre=_safe_str(item.get("name")),
+                    direccion=direccion or ubicacion,
+                    telefono=_safe_str(item.get("phone")),
+                    website=website,
+                    rating=_safe_str(item.get("overall_star_rating")),
+                    status_places=_safe_str(item.get("category")) or red.upper(),
+                    rubro=nicho,
+                    ubicacion=ubicacion,
+                    email="",
+                    linkedin="",
+                    fuente="instagram_graph" if red == "instagram" else "facebook_graph",
+                )
+            )
+        if not rows:
+            return _mock_social_leads(nicho, ubicacion, cantidad, red), f"{red}_vacio"
+        return pd.DataFrame(rows), f"{red}_graph"
+    except Exception as exc:  # noqa: BLE001
+        st.error(f"Error Meta Graph: {exc}")
+        return _mock_social_leads(nicho, ubicacion, cantidad, red), f"{red}_error"
+
+
+# ---------------------------------------------------------------------------
+# Directorios Argentina (vía webhook scraper o simulación estructurada)
+# ---------------------------------------------------------------------------
+DIRECTORIOS_AR = [
+    "Cuitonline",
+    "GuiaBancos",
+    "Páginas Amarillas",
+    "Mercado Libre Servicios",
+    "Doctoralia",
+    "PedidosYa Partners",
+]
+
+
+def _mock_directorio_ar_leads(
+    directorio: str,
+    nicho: str,
+    ubicacion: str,
+    cantidad: int,
+) -> pd.DataFrame:
+    city = ubicacion or "Pilar"
+    niches = nicho or "servicios"
+    suffix = {
+        "Cuitonline": "SAS",
+        "GuiaBancos": "Sucursal",
+        "Páginas Amarillas": "Avisos",
+        "Mercado Libre Servicios": "Prestador",
+        "Doctoralia": "Consultorio",
+        "PedidosYa Partners": "Local",
+    }.get(directorio, "AR")
+    rows = []
+    for i in range(cantidad):
+        domain = f"{re.sub(r'[^a-z0-9]+', '', niches.lower())[:10]}{i+1}.com.ar"
+        rows.append(
+            _normalize_lead_row(
+                nombre=f"{niches.title()} {suffix} {city} #{i+1}",
+                direccion=f"{city}, Buenos Aires, Argentina",
+                telefono=f"+54 11 5{100+i:03d}-{4000+i:04d}",
+                website=f"https://{domain}",
+                rating=str(round(3.8 + (i % 12) / 10, 1)),
+                status_places=directorio.upper()[:12],
+                rubro=niches,
+                ubicacion=city,
+                email=f"contacto@{domain}",
+                linkedin="",
+                fuente=f"directorio_ar:{directorio.lower().replace(' ', '_')}",
+            )
+        )
+    return pd.DataFrame(rows)
+
+
+def search_directorios_ar(
+    directorio: str,
+    nicho: str,
+    ubicacion: str,
+    cantidad: int,
+    webhook_url: str,
+    api_key: str = "",
+) -> tuple[pd.DataFrame, str]:
+    """
+    Extrae leads de directorios AR.
+    Sin API pública estable: usa webhook scraper (Make/n8n/Bright Data)
+    o simulación estructurada por directorio.
+    """
+    dir_name = directorio.strip() or "Páginas Amarillas"
+    if not webhook_url:
+        return (
+            _mock_directorio_ar_leads(dir_name, nicho, ubicacion, cantidad),
+            f"directorio_ar_simulado:{dir_name}",
+        )
+
+    headers = {"Content-Type": "application/json"}
+    if api_key:
+        headers["Authorization"] = f"Bearer {api_key}"
+    body = {
+        "action": "source_directorio_ar",
+        "directorio": dir_name,
+        "nicho": nicho,
+        "ubicacion": ubicacion,
+        "cantidad": int(cantidad),
+        "source": "katem_sdr",
+        "timestamp": _utc_now_iso(),
+    }
+    try:
+        resp = httpx.post(webhook_url, headers=headers, json=body, timeout=90.0)
+        if resp.status_code >= 400:
+            st.warning(f"Webhook directorio AR HTTP {resp.status_code}. Usando simulación.")
+            return (
+                _mock_directorio_ar_leads(dir_name, nicho, ubicacion, cantidad),
+                f"directorio_ar_fallback:{dir_name}",
+            )
+        payload = resp.json()
+        # Reusa parser flexible de Clay
+        rows = _parse_clay_leads_payload(
+            payload, nicho, ubicacion, f"directorio_ar:{dir_name.lower().replace(' ', '_')}"
+        )
+        if not rows:
+            return (
+                _mock_directorio_ar_leads(dir_name, nicho, ubicacion, cantidad),
+                f"directorio_ar_vacio:{dir_name}",
+            )
+        return pd.DataFrame(rows[:cantidad]), f"directorio_ar:{dir_name}"
+    except Exception as exc:  # noqa: BLE001
+        st.error(f"Error directorio AR ({dir_name}): {exc}")
+        return (
+            _mock_directorio_ar_leads(dir_name, nicho, ubicacion, cantidad),
+            f"directorio_ar_error:{dir_name}",
+        )
+
+
 def search_leads(
     source: str,
     nicho: str,
@@ -815,6 +1228,7 @@ def search_leads(
 ) -> tuple[pd.DataFrame, str]:
     """Dispatcher unificado de sourcing multi-fuente."""
     source_norm = (source or "").strip().lower()
+
     if source_norm.startswith("apollo"):
         return search_apollo_organizations(nicho, ubicacion, cantidad, cfg.get("apollo_key", ""))
     if source_norm.startswith("clay"):
@@ -825,8 +1239,52 @@ def search_leads(
             cfg.get("clay_key", ""),
             cfg.get("clay_webhook_url", ""),
         )
+    if source_norm.startswith("serpapi"):
+        return search_serpapi_maps(nicho, ubicacion, cantidad, cfg.get("serpapi_key", ""))
+    if source_norm.startswith("outscraper"):
+        return search_outscraper_maps(nicho, ubicacion, cantidad, cfg.get("outscraper_key", ""))
+    if source_norm.startswith("bright"):
+        return search_brightdata_maps(
+            nicho,
+            ubicacion,
+            cantidad,
+            cfg.get("brightdata_token", ""),
+            cfg.get("brightdata_maps_url", ""),
+        )
+    if "instagram" in source_norm:
+        return search_meta_pages(
+            nicho, ubicacion, cantidad, cfg.get("meta_token", ""), network="instagram"
+        )
+    if "facebook" in source_norm or source_norm.startswith("meta "):
+        return search_meta_pages(
+            nicho, ubicacion, cantidad, cfg.get("meta_token", ""), network="facebook"
+        )
+
+    # Directorios AR individuales o grupo
+    if source_norm.startswith("directorios ar"):
+        directorio = cfg.get("directorio_ar") or "Páginas Amarillas"
+        return search_directorios_ar(
+            directorio,
+            nicho,
+            ubicacion,
+            cantidad,
+            cfg.get("directorios_ar_webhook", ""),
+            cfg.get("directorios_ar_key", ""),
+        )
+    for d in DIRECTORIOS_AR:
+        if d.lower() in source_norm:
+            return search_directorios_ar(
+                d,
+                nicho,
+                ubicacion,
+                cantidad,
+                cfg.get("directorios_ar_webhook", ""),
+                cfg.get("directorios_ar_key", ""),
+            )
+
     # Default: Google Places
     return search_google_places(nicho, ubicacion, cantidad, cfg.get("google_key", ""))
+
 
 
 # ---------------------------------------------------------------------------
@@ -1636,6 +2094,42 @@ def render_sidebar() -> dict[str, str]:
         value=env_or_secret("CLAY_WEBHOOK_URL"),
         help="Webhook Clay para buscar/traer leads.",
     )
+    serpapi_key = st.sidebar.text_input(
+        "SerpAPI Key (Google Maps)",
+        value=env_or_secret("SERPAPI_KEY"),
+        type="password",
+    )
+    outscraper_key = st.sidebar.text_input(
+        "Outscraper API Key",
+        value=env_or_secret("OUTSCRAPER_API_KEY"),
+        type="password",
+    )
+    brightdata_token = st.sidebar.text_input(
+        "Bright Data Token",
+        value=env_or_secret("BRIGHTDATA_TOKEN"),
+        type="password",
+    )
+    brightdata_maps_url = st.sidebar.text_input(
+        "Bright Data Maps URL (collector)",
+        value=env_or_secret("BRIGHTDATA_MAPS_URL"),
+        help="Endpoint HTTP del collector/dataset de Maps.",
+    )
+    meta_token = st.sidebar.text_input(
+        "Meta Graph Token (Facebook/Instagram pages)",
+        value=env_or_secret("META_ACCESS_TOKEN"),
+        type="password",
+        help="Token para pages/search. Sin token → simulación social.",
+    )
+    directorios_ar_webhook = st.sidebar.text_input(
+        "Webhook Directorios AR (Make/n8n/scraper)",
+        value=env_or_secret("DIRECTORIOS_AR_WEBHOOK_URL"),
+        help="POST {directorio, nicho, ubicacion, cantidad} → JSON leads.",
+    )
+    directorios_ar_key = st.sidebar.text_input(
+        "Directorios AR webhook key (opcional)",
+        value=env_or_secret("DIRECTORIOS_AR_KEY"),
+        type="password",
+    )
 
     st.sidebar.markdown("#### Enrichment")
     hunter_key = st.sidebar.text_input(
@@ -1679,6 +2173,14 @@ def render_sidebar() -> dict[str, str]:
         "apollo_key": apollo_key.strip(),
         "clay_key": clay_key.strip(),
         "clay_webhook_url": clay_webhook_url.strip(),
+        "serpapi_key": serpapi_key.strip(),
+        "outscraper_key": outscraper_key.strip(),
+        "brightdata_token": brightdata_token.strip(),
+        "brightdata_maps_url": brightdata_maps_url.strip(),
+        "meta_token": meta_token.strip(),
+        "directorios_ar_webhook": directorios_ar_webhook.strip(),
+        "directorios_ar_key": directorios_ar_key.strip(),
+        "directorio_ar": "",  # se setea en el form de sourcing
         "hunter_key": hunter_key.strip(),
         "snov_key": snov_key.strip(),
         "clay_linkedin_webhook": clay_linkedin_webhook.strip(),
@@ -1772,7 +2274,7 @@ def render_pipeline_stepper() -> None:
 def tab_sourcing(cfg: dict[str, str]) -> None:
     st.subheader("🔍 Paso 1 — Búsqueda de Leads (Sourcing)")
     st.write(
-        "Elegí la fuente (Google Places, Apollo o Clay), buscá por rubro/ubicación, "
+        "Elegí la fuente (Maps, Apollo, Clay, Instagram/Facebook o directorios AR), buscá por rubro/ubicación, "
         "revisá la tabla, seleccioná leads y **aprobá el paso** para avanzar."
     )
 
@@ -1781,13 +2283,25 @@ def tab_sourcing(cfg: dict[str, str]) -> None:
             "Fuente de extracción",
             [
                 "Google Places",
+                "SerpAPI Maps",
+                "Outscraper Maps",
+                "Bright Data Maps",
                 "Apollo.io",
                 "Clay (webhook)",
+                "Instagram (Meta/local)",
+                "Facebook Pages (Meta)",
+                "Directorios AR",
+                "Cuitonline",
+                "GuiaBancos",
+                "Páginas Amarillas",
+                "Mercado Libre Servicios",
+                "Doctoralia",
+                "PedidosYa Partners",
             ],
             help=(
-                "Google Places: negocios locales. "
-                "Apollo: organizaciones B2B en la base de Apollo. "
-                "Clay: webhook de tu tabla/workbook Clay."
+                "Maps: Places / SerpAPI / Outscraper / Bright Data. "
+                "B2B: Apollo / Clay. Social: Instagram/Facebook. "
+                "AR: Cuitonline, GuiaBancos, Páginas Amarillas, ML Servicios, Doctoralia, PedidosYa."
             ),
         )
         c1, c2, c3 = st.columns([2, 2, 1])
@@ -1798,20 +2312,33 @@ def tab_sourcing(cfg: dict[str, str]) -> None:
         with c3:
             cantidad = st.number_input("Cantidad", min_value=1, max_value=60, value=8, step=1)
 
-        if fuente.startswith("Clay"):
-            st.caption(
-                "Clay espera un webhook que reciba "
-                "`{nicho, ubicacion, cantidad}` y responda JSON con leads "
-                "(`nombre/name`, `website/domain`, `telefono/phone`, etc.)."
+        directorio_ar = ""
+        if fuente == "Directorios AR":
+            directorio_ar = st.selectbox(
+                "Directorio Argentina",
+                DIRECTORIOS_AR,
+                help="Sin webhook scraper se usa extracción simulada estructurada por directorio.",
             )
+
+        if fuente.startswith("Clay"):
+            st.caption("Clay webhook: `{nicho, ubicacion, cantidad}` → JSON leads.")
         elif fuente.startswith("Apollo"):
+            st.caption("Apollo Organization Search. Sin key → simulación.")
+        elif fuente.startswith("SerpAPI"):
+            st.caption("Google Maps vía SerpAPI. Requiere `SERPAPI_KEY`.")
+        elif fuente.startswith("Outscraper"):
+            st.caption("Google Maps vía Outscraper. Requiere `OUTSCRAPER_API_KEY`.")
+        elif fuente.startswith("Bright"):
+            st.caption("Maps vía Bright Data collector URL + token.")
+        elif "Instagram" in fuente or "Facebook" in fuente:
+            st.caption("Meta Graph pages/search. Sin `META_ACCESS_TOKEN` → simulación social.")
+        elif fuente == "Directorios AR" or fuente in DIRECTORIOS_AR:
             st.caption(
-                "Apollo usa Organization Search. Sin `APOLLO_API_KEY` se genera una muestra simulada."
+                "Directorios AR: webhook scraper opcional (`DIRECTORIOS_AR_WEBHOOK_URL`). "
+                "Sin webhook → muestra estructurada por directorio."
             )
         else:
-            st.caption(
-                "Google Places. Sin `GOOGLE_MAPS_KEY` se genera extracción simulada estructurada."
-            )
+            st.caption("Google Places oficial. Sin key → simulación estructurada.")
 
         submitted = st.form_submit_button("Buscar leads", type="primary", use_container_width=True)
 
@@ -1819,6 +2346,9 @@ def tab_sourcing(cfg: dict[str, str]) -> None:
         if not nicho.strip() or not ubicacion.strip():
             st.error("Completá rubro y ubicación.")
         else:
+            cfg = dict(cfg)
+            if directorio_ar:
+                cfg["directorio_ar"] = directorio_ar
             with st.spinner(f"Consultando {fuente}…"):
                 df, mode = search_leads(
                     fuente,
@@ -2554,7 +3084,7 @@ def tab_dispatch(cfg: dict[str, str]) -> None:
 def tab_crm(cfg: dict[str, str]) -> None:
     st.subheader("📊 Paso 5 — CRM Local y Agendamiento")
     st.write(
-        f"Pipeline persistente en `{CRM_PATH.resolve()}`. "
+        f"Pipeline persistente en `{get_crm_path().resolve()}`. "
         "Actualizá estados (Contactado → Respuesta → Agendado) y exportá a CSV/Excel."
     )
 

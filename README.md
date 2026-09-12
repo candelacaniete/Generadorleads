@@ -2,7 +2,7 @@
 
 Panel unificado en Streamlit para el ciclo de prospección B2B:
 
-1. Sourcing de leads (Google Places / Apollo.io / Clay, o simulación)
+1. Sourcing de leads (Places / SerpAPI / Outscraper / Bright Data / Apollo / Clay / IG-FB / Directorios AR, o simulación)
 2. Scoring e icebreakers con OpenAI / Claude
 3. Despacho outbound a Instantly o webhook Make/n8n
 4. CRM local con pipeline y exportación CSV/Excel
@@ -18,7 +18,7 @@ Verticales template: directorios locales, B2B servicios, profesionales, retail.
 
 El flujo **no se ejecuta todo junto**: cada etapa tiene una puerta de aprobación.
 
-1. **Sourcing** → Places / Apollo / Clay · seleccioná y aprobá  
+1. **Sourcing** → Places / SerpAPI / Outscraper / Bright Data / Apollo / Clay / IG-FB / Directorios AR  
 2. **Enrichment** → email (Hunter/Snov/heurística) + LinkedIn vía Clay  
 3. **Scoring** → uno a uno o lote confirmado  
 4. **Despacho** → Instantly / webhook supervisado  
