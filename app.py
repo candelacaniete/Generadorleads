@@ -355,8 +355,21 @@ def append_dispatch_log(rows: list[dict[str, Any]]) -> pd.DataFrame:
 
 
 def env_or_secret(key: str, default: str = "") -> str:
-    """Prioriza variables de entorno (.env); permite override vía UI."""
-    return os.getenv(key, default) or default
+    """Prioriza `.env` / env vars; luego `st.secrets` (Streamlit Cloud); default al final."""
+    val = os.getenv(key)
+    if val:
+        return val
+    try:
+        secrets = st.secrets  # type: ignore[attr-defined]
+        if key in secrets:
+            return str(secrets[key] or "")
+        # También acepta bloque [secrets] anidado o claves en minúsculas
+        nested = secrets.get("secrets") if hasattr(secrets, "get") else None
+        if nested is not None and key in nested:
+            return str(nested[key] or "")
+    except Exception:  # noqa: BLE001 — sin secrets.toml / fuera de Streamlit
+        pass
+    return default or ""
 
 
 # ---------------------------------------------------------------------------
