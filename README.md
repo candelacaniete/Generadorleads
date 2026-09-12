@@ -2,7 +2,7 @@
 
 Panel unificado en Streamlit para el ciclo de prospección B2B:
 
-1. Sourcing de leads (Places / SerpAPI / Outscraper / Bright Data / Apollo / Clay API directa / IG-FB / Directorios AR, o simulación)
+1. Sourcing de leads (Places / SerpAPI / Outscraper / Bright Data Maps·IG·FB·LinkedIn / Apollo / Clay API / Meta Graph / Directorios AR, o simulación)
 2. Enrichment (email + LinkedIn) y scrape web → dolores / icebreaker con Claude
 3. Scoring supervisado + despacho outbound (Instantly / webhook)
 4. CRM local con pipeline y exportación CSV/Excel
@@ -18,7 +18,7 @@ Verticales template: directorios locales, B2B servicios, profesionales, retail.
 
 El flujo **no se ejecuta todo junto**: cada etapa tiene una puerta de aprobación.
 
-1. **Sourcing** → Places / SerpAPI / Outscraper / Bright Data / Apollo / **Clay Public API** (table ID + key, sin Make) / IG-FB / Directorios AR  
+1. **Sourcing** → Places / SerpAPI / Outscraper / Bright Data (Maps, IG, FB, LinkedIn) / Apollo / Clay API / Meta Graph / Directorios AR  
 2. **Enrichment** → email (Hunter/Snov/heurística) + LinkedIn (webhook opcional)  
 3. **Web / Dolores** → scrape del sitio + dolores/ángulo/icebreaker con Claude (o heurística)  
 4. **Scoring** → uno a uno o lote confirmado (usa dolores del scrape)  
@@ -44,3 +44,17 @@ Sin API keys la app sigue siendo usable: sourcing simulado, scrape+dolores heur�
 3. Copiá el table ID de la URL (`/tables/t_…`) a `CLAY_TABLE_ID`.
 4. En el panel: fuente **Clay (API)**; ajustá nombres de columnas en el expander del sidebar si no coinciden con los defaults.
 5. `CLAY_WEBHOOK_URL` queda solo como fallback legado si no hay table ID.
+
+## Bright Data (Maps + social)
+
+En **Scraper APIs** creá un collector por red y pegá:
+
+| Env | Scraper |
+|---|---|
+| `BRIGHTDATA_TOKEN` | API token (uno solo) |
+| `BRIGHTDATA_MAPS_URL` | Google Maps |
+| `BRIGHTDATA_IG_URL` | Instagram |
+| `BRIGHTDATA_FB_URL` | Facebook |
+| `BRIGHTDATA_LINKEDIN_URL` | LinkedIn companies |
+
+En el panel: fuentes **Bright Data Maps / Instagram / Facebook / LinkedIn**. Meta Graph queda como fallback.

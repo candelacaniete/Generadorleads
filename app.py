@@ -74,9 +74,9 @@ VERTICAL_TEMPLATES: dict[str, dict[str, Any]] = {
             "Google Places",
             "SerpAPI Maps",
             "Outscraper Maps",
+            "Bright Data Instagram",
+            "Bright Data Facebook",
             "Directorios AR",
-            "Instagram (Meta/local)",
-            "Facebook Pages (Meta)",
             "Clay (API)",
         ],
         "scoring_hint": "Cliente ideal para directorio local y servicios de presencia digital.",
@@ -85,7 +85,14 @@ VERTICAL_TEMPLATES: dict[str, dict[str, Any]] = {
         "label": "B2B servicios / agencias",
         "default_nicho": "agencias de marketing",
         "default_ubicacion": "Argentina",
-        "fuentes": ["Apollo.io", "Clay (API)", "Google Places", "SerpAPI Maps", "Bright Data Maps"],
+        "fuentes": [
+            "Apollo.io",
+            "Clay (API)",
+            "Bright Data LinkedIn",
+            "Google Places",
+            "SerpAPI Maps",
+            "Bright Data Maps",
+        ],
         "scoring_hint": "Cliente ideal para automatización SDR, outbound y growth B2B.",
     },
     "profesionales": {
@@ -95,8 +102,8 @@ VERTICAL_TEMPLATES: dict[str, dict[str, Any]] = {
         "fuentes": [
             "Google Places",
             "Doctoralia",
-            "Instagram (Meta/local)",
-            "Facebook Pages (Meta)",
+            "Bright Data Instagram",
+            "Bright Data Facebook",
             "Clay (API)",
         ],
         "scoring_hint": "Cliente ideal para captación de pacientes y reputación online.",
@@ -110,7 +117,7 @@ VERTICAL_TEMPLATES: dict[str, dict[str, Any]] = {
             "SerpAPI Maps",
             "Mercado Libre Servicios",
             "PedidosYa Partners",
-            "Instagram (Meta/local)",
+            "Bright Data Instagram",
             "Clay (API)",
         ],
         "scoring_hint": "Cliente ideal para performance ads, CRM y recuperación de carrito.",
@@ -1484,6 +1491,57 @@ def search_outscraper_maps(
         return _mock_places_leads(nicho, ubicacion, cantidad, "outscraper_error"), "outscraper_error"
 
 
+def _brightdata_post(
+    dataset_url: str,
+    api_token: str,
+    body: dict[str, Any] | list[Any],
+    timeout: float = 90.0,
+) -> tuple[Any | None, str, httpx.Response | None]:
+    """POST genérico a collector/dataset Bright Data. Retorna (payload, reason, resp)."""
+    headers = {
+        "Authorization": f"Bearer {api_token.strip()}",
+        "Content-Type": "application/json",
+        "Accept": "application/json",
+    }
+    try:
+        resp = httpx.post(dataset_url.strip(), headers=headers, json=body, timeout=timeout)
+        if resp.status_code >= 400:
+            return None, f"http_{resp.status_code}", resp
+        try:
+            return resp.json(), "ok", resp
+        except Exception:  # noqa: BLE001
+            return None, "no_json", resp
+    except Exception as exc:  # noqa: BLE001
+        return None, f"error:{exc}", None
+
+
+def _brightdata_extract_items(payload: Any) -> list[dict[str, Any]]:
+    if isinstance(payload, list):
+        return [x for x in payload if isinstance(x, dict)]
+    if not isinstance(payload, dict):
+        return []
+    for key in ("results", "data", "leads", "items", "records", "rows"):
+        nested = payload.get(key)
+        if isinstance(nested, list):
+            return [x for x in nested if isinstance(x, dict)]
+        if isinstance(nested, dict):
+            for k2 in ("results", "data", "items", "rows"):
+                inner = nested.get(k2)
+                if isinstance(inner, list):
+                    return [x for x in inner if isinstance(x, dict)]
+    return []
+
+
+def _brightdata_pick(item: dict[str, Any], *keys: str) -> str:
+    for k in keys:
+        if k in item and item.get(k) not in (None, ""):
+            return _safe_str(item.get(k))
+        for fk, fv in item.items():
+            if str(fk).lower() == k.lower() and fv not in (None, ""):
+                return _safe_str(fv)
+    return ""
+
+
 def search_brightdata_maps(
     nicho: str,
     ubicacion: str,
@@ -1494,15 +1552,10 @@ def search_brightdata_maps(
     """
     Google Maps vía Bright Data (dataset/collector HTTP).
     Espera BRIGHTDATA_TOKEN + BRIGHTDATA_MAPS_URL (endpoint del collector).
-    Body: {query, limit, country}.
     """
     if not api_token or not dataset_url:
         return _mock_places_leads(nicho, ubicacion, cantidad, "brightdata_simulado"), "brightdata_simulado"
 
-    headers = {
-        "Authorization": f"Bearer {api_token}",
-        "Content-Type": "application/json",
-    }
     body = {
         "query": f"{nicho} {ubicacion}",
         "nicho": nicho,
@@ -1511,40 +1564,183 @@ def search_brightdata_maps(
         "country": "AR",
         "source": "katem_sdr",
     }
-    try:
-        resp = httpx.post(dataset_url, headers=headers, json=body, timeout=90.0)
-        if resp.status_code >= 400:
-            st.warning(f"Bright Data HTTP {resp.status_code}. Usando simulación.")
-            return _mock_places_leads(nicho, ubicacion, cantidad, "brightdata_fallback"), "brightdata_fallback"
-        payload = resp.json()
-        items = payload if isinstance(payload, list) else (
-            payload.get("results") or payload.get("data") or payload.get("leads") or []
-        )
-        rows: list[dict[str, Any]] = []
-        for item in items[:cantidad]:
-            if not isinstance(item, dict):
-                continue
-            rows.append(
-                _normalize_lead_row(
-                    nombre=_safe_str(item.get("name") or item.get("title") or item.get("nombre")),
-                    direccion=_safe_str(item.get("address") or item.get("direccion")),
-                    telefono=_safe_str(item.get("phone") or item.get("telefono")),
-                    website=_safe_str(item.get("website") or item.get("url")),
-                    rating=_safe_str(item.get("rating")),
-                    status_places="BRIGHTDATA",
-                    rubro=nicho,
-                    ubicacion=ubicacion,
-                    email=_safe_str(item.get("email")),
-                    linkedin=_safe_str(item.get("linkedin")),
-                    fuente="brightdata_maps",
-                )
+    payload, reason, resp = _brightdata_post(dataset_url, api_token, body)
+    if payload is None:
+        code = resp.status_code if resp is not None else "?"
+        st.warning(f"Bright Data Maps `{reason}` (HTTP {code}). Usando simulación.")
+        return _mock_places_leads(nicho, ubicacion, cantidad, "brightdata_fallback"), "brightdata_fallback"
+
+    rows: list[dict[str, Any]] = []
+    for item in _brightdata_extract_items(payload)[:cantidad]:
+        nombre = _brightdata_pick(item, "name", "title", "nombre", "business_name")
+        if not nombre:
+            continue
+        rows.append(
+            _normalize_lead_row(
+                nombre=nombre,
+                direccion=_brightdata_pick(item, "address", "direccion", "full_address"),
+                telefono=_brightdata_pick(item, "phone", "telefono", "phone_number"),
+                website=_brightdata_pick(item, "website", "url", "link"),
+                rating=_brightdata_pick(item, "rating", "stars"),
+                status_places="BRIGHTDATA",
+                rubro=nicho,
+                ubicacion=ubicacion,
+                email=_brightdata_pick(item, "email"),
+                linkedin=_brightdata_pick(item, "linkedin", "linkedin_url"),
+                fuente="brightdata_maps",
             )
-        if not rows:
-            return _mock_places_leads(nicho, ubicacion, cantidad, "brightdata_vacio"), "brightdata_vacio"
-        return pd.DataFrame(rows), "brightdata_maps"
-    except Exception as exc:  # noqa: BLE001
-        st.error(f"Error Bright Data: {exc}")
-        return _mock_places_leads(nicho, ubicacion, cantidad, "brightdata_error"), "brightdata_error"
+        )
+    if not rows:
+        return _mock_places_leads(nicho, ubicacion, cantidad, "brightdata_vacio"), "brightdata_vacio"
+    return pd.DataFrame(rows), "brightdata_maps"
+
+
+def search_brightdata_social(
+    network: str,
+    nicho: str,
+    ubicacion: str,
+    cantidad: int,
+    api_token: str,
+    dataset_url: str,
+) -> tuple[pd.DataFrame, str]:
+    """
+    Instagram / Facebook / LinkedIn vía Bright Data Scraper API (collector URL).
+
+    Misma idea que Maps: un dataset/collector por red + token compartido.
+    Env:
+      BRIGHTDATA_IG_URL / BRIGHTDATA_FB_URL / BRIGHTDATA_LINKEDIN_URL
+    """
+    red = (network or "instagram").strip().lower()
+    if red.startswith("insta"):
+        red = "instagram"
+    elif red.startswith("face") or red.startswith("fb"):
+        red = "facebook"
+    elif red.startswith("link"):
+        red = "linkedin"
+    else:
+        red = "instagram"
+
+    fuente = f"brightdata_{red}"
+    if not api_token or not dataset_url:
+        if red == "linkedin":
+            # reusa mock social con website=linkedin heurístico
+            df = _mock_social_leads(nicho, ubicacion, cantidad, "facebook")
+            df = df.copy()
+            df["website"] = [
+                f"https://www.linkedin.com/company/{re.sub(r'[^a-z0-9]+', '', (nicho or 'empresa').lower())[:20]}{i}"
+                for i in range(1, len(df) + 1)
+            ]
+            df["linkedin"] = df["website"]
+            df["fuente"] = "brightdata_linkedin_simulado"
+            df["status_places"] = "LINKEDIN"
+            return df, "brightdata_linkedin_simulado"
+        return _mock_social_leads(nicho, ubicacion, cantidad, red), f"{fuente}_simulado"
+
+    body = {
+        "query": f"{nicho} {ubicacion}".strip(),
+        "keyword": nicho,
+        "location": ubicacion,
+        "nicho": nicho,
+        "ubicacion": ubicacion,
+        "limit": int(cantidad),
+        "country": "AR",
+        "network": red,
+        "platform": red,
+        "source": "katem_sdr",
+    }
+    # LinkedIn company search a veces espera array de inputs
+    if red == "linkedin":
+        body_alt: Any = [
+            {
+                "url": f"https://www.linkedin.com/search/results/companies/?keywords={nicho}%20{ubicacion}",
+                "keyword": nicho,
+                "location": ubicacion,
+            }
+        ]
+    else:
+        body_alt = body
+
+    payload, reason, resp = _brightdata_post(dataset_url, api_token, body)
+    if payload is None and red == "linkedin":
+        payload, reason, resp = _brightdata_post(dataset_url, api_token, body_alt)
+
+    if payload is None:
+        code = resp.status_code if resp is not None else "?"
+        st.warning(
+            f"Bright Data {red} `{reason}` (HTTP {code}). "
+            "Revisá dataset URL del Scraper API. Usando simulación."
+        )
+        if red == "linkedin":
+            df = _mock_social_leads(nicho, ubicacion, cantidad, "facebook")
+            df = df.copy()
+            df["linkedin"] = [
+                f"https://www.linkedin.com/company/sim-{i}" for i in range(1, len(df) + 1)
+            ]
+            df["fuente"] = "brightdata_linkedin_fallback"
+            df["status_places"] = "LINKEDIN"
+            return df, "brightdata_linkedin_fallback"
+        return _mock_social_leads(nicho, ubicacion, cantidad, red), f"{fuente}_fallback"
+
+    rows: list[dict[str, Any]] = []
+    for item in _brightdata_extract_items(payload)[:cantidad]:
+        nombre = _brightdata_pick(
+            item,
+            "name",
+            "full_name",
+            "title",
+            "nombre",
+            "company_name",
+            "profile_name",
+            "username",
+            "handle",
+        )
+        if not nombre:
+            continue
+        profile = _brightdata_pick(
+            item,
+            "profile_url",
+            "url",
+            "link",
+            "profile",
+            "input_url",
+            "website",
+            "linkedin_url",
+            "company_url",
+        )
+        handle = _brightdata_pick(item, "username", "handle", "screen_name", "vanity_name")
+        if not profile and handle:
+            if red == "instagram":
+                profile = f"https://instagram.com/{handle.lstrip('@')}"
+            elif red == "facebook":
+                profile = f"https://facebook.com/{handle}"
+            elif red == "linkedin":
+                profile = f"https://www.linkedin.com/company/{handle}"
+
+        linkedin = profile if red == "linkedin" else _brightdata_pick(item, "linkedin", "linkedin_url")
+        website = profile
+        if red != "linkedin":
+            website = _brightdata_pick(item, "website", "external_url", "bio_link") or profile
+
+        rows.append(
+            _normalize_lead_row(
+                nombre=nombre,
+                direccion=_brightdata_pick(item, "address", "location", "city", "direccion") or ubicacion,
+                telefono=_brightdata_pick(item, "phone", "telefono", "phone_number"),
+                website=website,
+                rating=_brightdata_pick(item, "followers", "followers_count", "rating", "employee_count"),
+                status_places=red.upper(),
+                rubro=nicho,
+                ubicacion=ubicacion,
+                email=_brightdata_pick(item, "email", "emails"),
+                linkedin=linkedin,
+                fuente=fuente,
+            )
+        )
+
+    if not rows:
+        st.warning(f"Bright Data {red} respondió sin filas parseables. Usando simulación.")
+        return _mock_social_leads(nicho, ubicacion, cantidad, "facebook" if red == "linkedin" else red), f"{fuente}_vacio"
+    return pd.DataFrame(rows), fuente
 
 
 # ---------------------------------------------------------------------------
@@ -1809,6 +2005,35 @@ def search_leads(
         return search_serpapi_maps(nicho, ubicacion, cantidad, cfg.get("serpapi_key", ""))
     if source_norm.startswith("outscraper"):
         return search_outscraper_maps(nicho, ubicacion, cantidad, cfg.get("outscraper_key", ""))
+
+    # Bright Data: Maps / Instagram / Facebook / LinkedIn (URLs de collector por red)
+    if "bright" in source_norm and "instagram" in source_norm:
+        return search_brightdata_social(
+            "instagram",
+            nicho,
+            ubicacion,
+            cantidad,
+            cfg.get("brightdata_token", ""),
+            cfg.get("brightdata_ig_url", ""),
+        )
+    if "bright" in source_norm and "facebook" in source_norm:
+        return search_brightdata_social(
+            "facebook",
+            nicho,
+            ubicacion,
+            cantidad,
+            cfg.get("brightdata_token", ""),
+            cfg.get("brightdata_fb_url", ""),
+        )
+    if "bright" in source_norm and "linkedin" in source_norm:
+        return search_brightdata_social(
+            "linkedin",
+            nicho,
+            ubicacion,
+            cantidad,
+            cfg.get("brightdata_token", ""),
+            cfg.get("brightdata_linkedin_url", ""),
+        )
     if source_norm.startswith("bright"):
         return search_brightdata_maps(
             nicho,
@@ -1817,13 +2042,48 @@ def search_leads(
             cfg.get("brightdata_token", ""),
             cfg.get("brightdata_maps_url", ""),
         )
+
+    # Meta Graph (fallback si no hay Bright Data social)
     if "instagram" in source_norm:
+        # Si hay BD IG configurado y la fuente no dijo Meta explícito, preferir BD
+        if cfg.get("brightdata_ig_url") and cfg.get("brightdata_token") and "meta" not in source_norm:
+            return search_brightdata_social(
+                "instagram",
+                nicho,
+                ubicacion,
+                cantidad,
+                cfg.get("brightdata_token", ""),
+                cfg.get("brightdata_ig_url", ""),
+            )
         return search_meta_pages(
             nicho, ubicacion, cantidad, cfg.get("meta_token", ""), network="instagram"
         )
     if "facebook" in source_norm or source_norm.startswith("meta "):
+        if (
+            cfg.get("brightdata_fb_url")
+            and cfg.get("brightdata_token")
+            and "meta" not in source_norm
+            and "pages" not in source_norm
+        ):
+            return search_brightdata_social(
+                "facebook",
+                nicho,
+                ubicacion,
+                cantidad,
+                cfg.get("brightdata_token", ""),
+                cfg.get("brightdata_fb_url", ""),
+            )
         return search_meta_pages(
             nicho, ubicacion, cantidad, cfg.get("meta_token", ""), network="facebook"
+        )
+    if source_norm.startswith("linkedin"):
+        return search_brightdata_social(
+            "linkedin",
+            nicho,
+            ubicacion,
+            cantidad,
+            cfg.get("brightdata_token", ""),
+            cfg.get("brightdata_linkedin_url", ""),
         )
 
     # Directorios AR individuales o grupo
@@ -3247,17 +3507,34 @@ def render_sidebar() -> dict[str, str]:
         "Bright Data Token",
         value=env_or_secret("BRIGHTDATA_TOKEN"),
         type="password",
+        help="API token de Bright Data (Scraper APIs). Un token para Maps/IG/FB/LinkedIn.",
     )
-    brightdata_maps_url = st.sidebar.text_input(
-        "Bright Data Maps URL (collector)",
-        value=env_or_secret("BRIGHTDATA_MAPS_URL"),
-        help="Endpoint HTTP del collector/dataset de Maps.",
-    )
+    with st.sidebar.expander("Bright Data collectors (URLs)", expanded=False):
+        brightdata_maps_url = st.text_input(
+            "Maps dataset/collector URL",
+            value=env_or_secret("BRIGHTDATA_MAPS_URL"),
+            help="Trigger URL del scraper Google Maps.",
+        )
+        brightdata_ig_url = st.text_input(
+            "Instagram dataset/collector URL",
+            value=env_or_secret("BRIGHTDATA_IG_URL"),
+            help="Scraper API Instagram (perfiles/búsqueda).",
+        )
+        brightdata_fb_url = st.text_input(
+            "Facebook dataset/collector URL",
+            value=env_or_secret("BRIGHTDATA_FB_URL"),
+            help="Scraper API Facebook Pages.",
+        )
+        brightdata_linkedin_url = st.text_input(
+            "LinkedIn dataset/collector URL",
+            value=env_or_secret("BRIGHTDATA_LINKEDIN_URL"),
+            help="Scraper API LinkedIn companies/people.",
+        )
     meta_token = st.sidebar.text_input(
         "Meta Graph Token (Facebook/Instagram pages)",
         value=env_or_secret("META_ACCESS_TOKEN"),
         type="password",
-        help="Token para pages/search. Sin token → simulación social.",
+        help="Solo si usás fuente Meta Graph. Preferí Bright Data IG/FB si tenés scrapers.",
     )
     directorios_ar_webhook = st.sidebar.text_input(
         "Webhook Directorios AR (Make/n8n/scraper)",
@@ -3328,6 +3605,9 @@ def render_sidebar() -> dict[str, str]:
         "outscraper_key": outscraper_key.strip(),
         "brightdata_token": brightdata_token.strip(),
         "brightdata_maps_url": brightdata_maps_url.strip(),
+        "brightdata_ig_url": brightdata_ig_url.strip(),
+        "brightdata_fb_url": brightdata_fb_url.strip(),
+        "brightdata_linkedin_url": brightdata_linkedin_url.strip(),
         "meta_token": meta_token.strip(),
         "directorios_ar_webhook": directorios_ar_webhook.strip(),
         "directorios_ar_key": directorios_ar_key.strip(),
@@ -3438,9 +3718,12 @@ def tab_sourcing(cfg: dict[str, str]) -> None:
                 "SerpAPI Maps",
                 "Outscraper Maps",
                 "Bright Data Maps",
+                "Bright Data Instagram",
+                "Bright Data Facebook",
+                "Bright Data LinkedIn",
                 "Apollo.io",
                 "Clay (API)",
-                "Instagram (Meta/local)",
+                "Instagram (Meta Graph)",
                 "Facebook Pages (Meta)",
                 "Directorios AR",
                 "Cuitonline",
@@ -3452,8 +3735,8 @@ def tab_sourcing(cfg: dict[str, str]) -> None:
             ],
             help=(
                 "Maps: Places / SerpAPI / Outscraper / Bright Data. "
-                "B2B: Apollo / Clay API. Social: Instagram/Facebook. "
-                "AR: Cuitonline, GuiaBancos, Páginas Amarillas, ML Servicios, Doctoralia, PedidosYa."
+                "Social: Bright Data IG/FB/LinkedIn (recomendado) o Meta Graph. "
+                "B2B: Apollo / Clay API. AR: directorios."
             ),
         )
         c1, c2, c3 = st.columns([2, 2, 1])
@@ -3490,9 +3773,18 @@ def tab_sourcing(cfg: dict[str, str]) -> None:
         elif fuente.startswith("Outscraper"):
             st.caption("Google Maps vía Outscraper. Requiere `OUTSCRAPER_API_KEY`.")
         elif fuente.startswith("Bright"):
-            st.caption("Maps vía Bright Data collector URL + token.")
+            st.caption(
+                "Bright Data Scraper APIs: un collector URL por red + token compartido "
+                "(`BRIGHTDATA_TOKEN` + Maps/IG/FB/LinkedIn URL en el expander del sidebar)."
+            )
         elif "Instagram" in fuente or "Facebook" in fuente:
-            st.caption("Meta Graph pages/search. Sin `META_ACCESS_TOKEN` → simulación social.")
+            if "Bright" in fuente:
+                st.caption("Bright Data social scraper. Sin URL → simulación.")
+            else:
+                st.caption(
+                    "Meta Graph pages/search (requiere Page Public Metadata Access). "
+                    "Si falla → preferí **Bright Data Instagram/Facebook**."
+                )
         elif fuente == "Directorios AR" or fuente in DIRECTORIOS_AR:
             st.caption(
                 "Directorios AR: webhook scraper opcional (`DIRECTORIOS_AR_WEBHOOK_URL`). "
