@@ -1319,7 +1319,20 @@ def search_meta_pages(
     try:
         resp = httpx.get(url, params=params, timeout=40.0)
         if resp.status_code >= 400:
-            st.warning(f"Meta Graph HTTP {resp.status_code}. Usando simulación {red}.")
+            detail = ""
+            try:
+                err = resp.json().get("error") or {}
+                detail = _safe_str(err.get("message") or err.get("error_user_msg") or err.get("type"))
+            except Exception:
+                detail = (resp.text or "")[:200]
+            tip = (
+                "Para `pages/search` necesitás permiso **pages_search** (o Page Public Content Access), "
+                "no solo WhatsApp. Token de usuario/sistema con ese scope; WhatsApp WABA no alcanza."
+            )
+            st.warning(
+                f"Meta Graph HTTP {resp.status_code}. {tip} "
+                f"Detalle: `{detail or '(sin cuerpo)'}`. Usando simulación {red}."
+            )
             return _mock_social_leads(nicho, ubicacion, cantidad, red), f"{red}_fallback"
         payload = resp.json()
         data = payload.get("data") or []
