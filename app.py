@@ -612,58 +612,103 @@ def search_apollo_organizations(
     api_key: str,
 ) -> tuple[pd.DataFrame, str]:
     """
-    Busca organizaciones en Apollo.io (mixed_companies/search).
-    Sin API key → muestra simulada estilo Apollo.
+    Busca organizaciones en Apollo.io (Organization Search).
+
+    Endpoint: POST /api/v1/mixed_companies/search
+    Auth: header `x-api-key` (requerido). El plan debe incluir este endpoint
+    (403 típico = free/trial o API key sin scope/master).
     """
-    if not api_key:
+    key = (api_key or "").strip()
+    if not key:
         return (
             _mock_places_leads(nicho, ubicacion, cantidad, "apollo_simulado"),
             "apollo_simulado",
         )
 
-    url = "https://api.apollo.io/api/v1/mixed_companies/search"
     headers = {
         "Content-Type": "application/json",
         "Cache-Control": "no-cache",
-        "X-Api-Key": api_key,
+        "Accept": "application/json",
+        "x-api-key": key,
+        "X-Api-Key": key,
     }
-    # Filtros: keyword + ubicación (Apollo acepta organization_locations[])
-    params: dict[str, Any] = {
+    per_page = min(max(int(cantidad), 1), 100)
+    # Body + query params (Apollo acepta ambos según versión)
+    body = {
         "q_organization_keyword_tags": nicho,
-        "organization_locations[]": ubicacion,
-        "per_page": min(max(int(cantidad), 1), 100),
+        "organization_locations": [ubicacion] if ubicacion else [],
+        "per_page": per_page,
         "page": 1,
     }
-    try:
-        resp = httpx.post(url, headers=headers, params=params, json={}, timeout=45.0)
-        # Algunos planes usan body en vez de query; reintento defensivo
-        if resp.status_code >= 400:
-            body = {
-                "q_organization_keyword_tags": nicho,
-                "organization_locations": [ubicacion],
-                "per_page": min(max(int(cantidad), 1), 100),
-                "page": 1,
-            }
-            resp = httpx.post(url, headers=headers, json=body, timeout=45.0)
+    params = {
+        "q_organization_keyword_tags": nicho,
+        "organization_locations[]": ubicacion,
+        "per_page": per_page,
+        "page": 1,
+    }
 
+    endpoints = [
+        "https://api.apollo.io/api/v1/mixed_companies/search",
+        "https://api.apollo.io/v1/mixed_companies/search",
+    ]
+
+    last_status = 0
+    last_detail = ""
+    last_url = endpoints[0]
+
+    try:
+        resp: httpx.Response | None = None
+        for url in endpoints:
+            last_url = url
+            # Intento 1: params en query
+            resp = httpx.post(url, headers=headers, params=params, json={}, timeout=45.0)
+            last_status = resp.status_code
+            last_detail = _apollo_error_detail(resp)
+            if resp.status_code < 400:
+                break
+            # Intento 2: filtros en body
+            resp = httpx.post(url, headers=headers, json=body, timeout=45.0)
+            last_status = resp.status_code
+            last_detail = _apollo_error_detail(resp)
+            if resp.status_code < 400:
+                break
+
+        assert resp is not None
         if resp.status_code >= 400:
+            tip = _apollo_status_tip(resp.status_code, last_detail)
             st.warning(
-                f"Apollo respondió HTTP {resp.status_code}. "
-                "Se usará extracción simulada Apollo para no bloquear el flujo."
+                f"Apollo HTTP {resp.status_code} en `{last_url}`. {tip} "
+                f"Detalle: `{last_detail or '(sin cuerpo)'}`. "
+                "Se usará extracción simulada para no bloquear el flujo."
             )
+            with st.expander("Detalle Apollo", expanded=False):
+                st.code(
+                    f"URL: {last_url}\n"
+                    f"Status: {resp.status_code}\n"
+                    f"Body: {_clay_response_preview(resp, 800)}"
+                )
             return (
-                _mock_places_leads(nicho, ubicacion, cantidad, "apollo_simulado_fallback"),
-                "apollo_simulado_fallback",
+                _mock_places_leads(nicho, ubicacion, cantidad, f"apollo_simulado_http{resp.status_code}"),
+                f"apollo_simulado_http{resp.status_code}",
             )
 
         payload = resp.json()
-        orgs = payload.get("organizations") or payload.get("accounts") or []
+        orgs = (
+            payload.get("organizations")
+            or payload.get("accounts")
+            or payload.get("companies")
+            or []
+        )
         rows: list[dict[str, Any]] = []
         for org in orgs[:cantidad]:
+            if not isinstance(org, dict):
+                continue
             phone = ""
             primary_phone = org.get("primary_phone") or {}
             if isinstance(primary_phone, dict):
-                phone = _safe_str(primary_phone.get("number") or primary_phone.get("sanitized_number"))
+                phone = _safe_str(
+                    primary_phone.get("number") or primary_phone.get("sanitized_number")
+                )
             elif primary_phone:
                 phone = _safe_str(primary_phone)
             if not phone:
@@ -671,15 +716,19 @@ def search_apollo_organizations(
 
             address_parts = [
                 _safe_str(org.get("raw_address")),
+                _safe_str(org.get("street_address")),
                 _safe_str(org.get("city")),
                 _safe_str(org.get("state")),
                 _safe_str(org.get("country")),
             ]
-            direccion = ", ".join([p for p in address_parts if p]) or _safe_str(org.get("street_address"))
+            direccion = ", ".join([p for p in address_parts if p])
 
+            nombre = _safe_str(org.get("name") or org.get("organization_name"))
+            if not nombre:
+                continue
             rows.append(
                 _normalize_lead_row(
-                    nombre=_safe_str(org.get("name") or org.get("organization_name")),
+                    nombre=nombre,
                     direccion=direccion,
                     telefono=phone,
                     website=_safe_str(org.get("website_url") or org.get("primary_domain")),
@@ -707,6 +756,50 @@ def search_apollo_organizations(
             _mock_places_leads(nicho, ubicacion, cantidad, "apollo_simulado_error"),
             "apollo_simulado_error",
         )
+
+
+def _apollo_error_detail(resp: httpx.Response) -> str:
+    """Extrae message/error del body Apollo para diagnóstico."""
+    try:
+        data = resp.json()
+        if isinstance(data, dict):
+            return _safe_str(
+                data.get("message")
+                or data.get("error")
+                or data.get("error_message")
+                or data.get("hint")
+            )[:400]
+    except Exception:
+        pass
+    return (resp.text or "").replace("\n", " ").strip()[:400]
+
+
+def _apollo_status_tip(status: int, detail: str) -> str:
+    d = (detail or "").lower()
+    if status == 401:
+        return "API key inválida o revocada. Regenerá la key en Apollo → Settings → Integrations → API."
+    if status == 403:
+        if "paid" in d or "plan" in d:
+            return (
+                "Tu plan Apollo no incluye Organization Search (típico en free/trial). "
+                "Necesitás plan pago con acceso a `mixed_companies/search`, "
+                "o una Master API key con ese scope."
+            )
+        if "not authorized" in d or "inaccessible" in d or "master" in d:
+            return (
+                "La API key no tiene scope para este endpoint. "
+                "Creá una Master API key o habilitá `api/v1/mixed_companies/search`."
+            )
+        return (
+            "403 Forbidden: plan sin acceso o key sin scope. "
+            "En Apollo: Settings → Plans (pago) y Settings → Integrations → API (master key)."
+        )
+    if status == 422:
+        return "Parámetros de búsqueda inválidos; probá otro nicho/ubicación."
+    if status == 429:
+        return "Rate limit Apollo; esperá o upgradá el plan."
+    return "Revisá key, plan y créditos API."
+
 
 
 # ---------------------------------------------------------------------------
@@ -2615,6 +2708,11 @@ def render_sidebar() -> dict[str, str]:
         "Apollo.io API Key",
         value=env_or_secret("APOLLO_API_KEY"),
         type="password",
+        help=(
+            "Organization Search requiere plan pago + API key con scope "
+            "`mixed_companies/search` (idealmente Master key). "
+            "403 = free/trial o key sin permiso."
+        ),
     )
     clay_key = st.sidebar.text_input(
         "Clay API Key",
@@ -2867,7 +2965,11 @@ def tab_sourcing(cfg: dict[str, str]) -> None:
                 "Monitor webhook nativo de Clay solo ACK → cae a simulación."
             )
         elif fuente.startswith("Apollo"):
-            st.caption("Apollo Organization Search. Sin key → simulación.")
+            st.caption(
+                "Apollo Organization Search (`mixed_companies/search`). "
+                "Requiere plan pago + Master API key. 403 → free/trial o key sin scope; "
+                "en ese caso usamos simulación."
+            )
         elif fuente.startswith("SerpAPI"):
             st.caption("Google Maps vía SerpAPI. Requiere `SERPAPI_KEY`.")
         elif fuente.startswith("Outscraper"):
