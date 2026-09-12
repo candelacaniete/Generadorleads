@@ -172,8 +172,8 @@ def env_or_secret(key: str, default: str = "") -> str:
 # ---------------------------------------------------------------------------
 # Integración: Google Places (Text Search + Place Details)
 # ---------------------------------------------------------------------------
-def _mock_places_leads(nicho: str, ubicacion: str, cantidad: int) -> pd.DataFrame:
-    """Extracción estructurada simulada cuando no hay GOOGLE_MAPS_KEY."""
+def _mock_places_leads(nicho: str, ubicacion: str, cantidad: int, fuente: str = "simulado") -> pd.DataFrame:
+    """Extracción estructurada simulada cuando no hay API key de la fuente elegida."""
     niches = nicho or "negocios locales"
     city = ubicacion or "Pilar"
     samples = [
@@ -261,7 +261,7 @@ def _mock_places_leads(nicho: str, ubicacion: str, cantidad: int) -> pd.DataFram
                 "rubro": niches,
                 "ubicacion": city,
                 "seleccionado": False,
-                "fuente": "simulado",
+                "fuente": fuente,
             }
         )
     return pd.DataFrame(rows)
@@ -380,7 +380,304 @@ def search_google_places(
 
     except Exception as exc:  # noqa: BLE001
         st.error(f"Error consultando Google Places: {exc}")
-        return _mock_places_leads(nicho, ubicacion, cantidad), "simulado_error"
+        return _mock_places_leads(nicho, ubicacion, cantidad, "simulado_error"), "simulado_error"
+
+
+# ---------------------------------------------------------------------------
+# Integración: Apollo.io — Organization Search
+# ---------------------------------------------------------------------------
+def _normalize_lead_row(
+    *,
+    nombre: str,
+    direccion: str = "",
+    telefono: str = "",
+    website: str = "",
+    rating: str = "",
+    status_places: str = "",
+    rubro: str = "",
+    ubicacion: str = "",
+    email: str = "",
+    linkedin: str = "",
+    fuente: str = "",
+) -> dict[str, Any]:
+    return {
+        "id": str(uuid.uuid4())[:8],
+        "nombre": _safe_str(nombre),
+        "direccion": _safe_str(direccion),
+        "telefono": _safe_str(telefono),
+        "website": _safe_str(website),
+        "rating": _safe_str(rating),
+        "status_places": _safe_str(status_places) or "UNKNOWN",
+        "rubro": _safe_str(rubro),
+        "ubicacion": _safe_str(ubicacion),
+        "email": _safe_str(email),
+        "linkedin": _safe_str(linkedin),
+        "seleccionado": False,
+        "fuente": _safe_str(fuente),
+    }
+
+
+def search_apollo_organizations(
+    nicho: str,
+    ubicacion: str,
+    cantidad: int,
+    api_key: str,
+) -> tuple[pd.DataFrame, str]:
+    """
+    Busca organizaciones en Apollo.io (mixed_companies/search).
+    Sin API key → muestra simulada estilo Apollo.
+    """
+    if not api_key:
+        return (
+            _mock_places_leads(nicho, ubicacion, cantidad, "apollo_simulado"),
+            "apollo_simulado",
+        )
+
+    url = "https://api.apollo.io/api/v1/mixed_companies/search"
+    headers = {
+        "Content-Type": "application/json",
+        "Cache-Control": "no-cache",
+        "X-Api-Key": api_key,
+    }
+    # Filtros: keyword + ubicación (Apollo acepta organization_locations[])
+    params: dict[str, Any] = {
+        "q_organization_keyword_tags": nicho,
+        "organization_locations[]": ubicacion,
+        "per_page": min(max(int(cantidad), 1), 100),
+        "page": 1,
+    }
+    try:
+        resp = httpx.post(url, headers=headers, params=params, json={}, timeout=45.0)
+        # Algunos planes usan body en vez de query; reintento defensivo
+        if resp.status_code >= 400:
+            body = {
+                "q_organization_keyword_tags": nicho,
+                "organization_locations": [ubicacion],
+                "per_page": min(max(int(cantidad), 1), 100),
+                "page": 1,
+            }
+            resp = httpx.post(url, headers=headers, json=body, timeout=45.0)
+
+        if resp.status_code >= 400:
+            st.warning(
+                f"Apollo respondió HTTP {resp.status_code}. "
+                "Se usará extracción simulada Apollo para no bloquear el flujo."
+            )
+            return (
+                _mock_places_leads(nicho, ubicacion, cantidad, "apollo_simulado_fallback"),
+                "apollo_simulado_fallback",
+            )
+
+        payload = resp.json()
+        orgs = payload.get("organizations") or payload.get("accounts") or []
+        rows: list[dict[str, Any]] = []
+        for org in orgs[:cantidad]:
+            phone = ""
+            primary_phone = org.get("primary_phone") or {}
+            if isinstance(primary_phone, dict):
+                phone = _safe_str(primary_phone.get("number") or primary_phone.get("sanitized_number"))
+            elif primary_phone:
+                phone = _safe_str(primary_phone)
+            if not phone:
+                phone = _safe_str(org.get("phone") or org.get("sanitized_phone"))
+
+            address_parts = [
+                _safe_str(org.get("raw_address")),
+                _safe_str(org.get("city")),
+                _safe_str(org.get("state")),
+                _safe_str(org.get("country")),
+            ]
+            direccion = ", ".join([p for p in address_parts if p]) or _safe_str(org.get("street_address"))
+
+            rows.append(
+                _normalize_lead_row(
+                    nombre=_safe_str(org.get("name") or org.get("organization_name")),
+                    direccion=direccion,
+                    telefono=phone,
+                    website=_safe_str(org.get("website_url") or org.get("primary_domain")),
+                    rating=_safe_str(org.get("estimated_num_employees") or org.get("industry")),
+                    status_places="APOLLO",
+                    rubro=nicho,
+                    ubicacion=ubicacion,
+                    email="",
+                    linkedin=_safe_str(org.get("linkedin_url")),
+                    fuente="apollo",
+                )
+            )
+
+        if not rows:
+            st.info("Apollo no devolvió organizaciones. Generando muestra simulada.")
+            return (
+                _mock_places_leads(nicho, ubicacion, cantidad, "apollo_simulado_vacio"),
+                "apollo_simulado_vacio",
+            )
+        return pd.DataFrame(rows), "apollo"
+
+    except Exception as exc:  # noqa: BLE001
+        st.error(f"Error consultando Apollo: {exc}")
+        return (
+            _mock_places_leads(nicho, ubicacion, cantidad, "apollo_simulado_error"),
+            "apollo_simulado_error",
+        )
+
+
+# ---------------------------------------------------------------------------
+# Integración: Clay — Webhook / API de tabla
+# ---------------------------------------------------------------------------
+def _parse_clay_leads_payload(payload: Any, nicho: str, ubicacion: str, fuente: str) -> list[dict[str, Any]]:
+    """Normaliza respuestas típicas de Clay (lista, {leads|rows|results|data})."""
+    items: list[Any]
+    if isinstance(payload, list):
+        items = payload
+    elif isinstance(payload, dict):
+        items = (
+            payload.get("leads")
+            or payload.get("rows")
+            or payload.get("results")
+            or payload.get("data")
+            or payload.get("records")
+            or []
+        )
+        if isinstance(items, dict):
+            items = items.get("rows") or items.get("items") or []
+    else:
+        items = []
+
+    rows: list[dict[str, Any]] = []
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        # Clay suele anidar campos en "fields" / "cells"
+        fields = item.get("fields") or item.get("cells") or item
+        if not isinstance(fields, dict):
+            continue
+
+        def pick(*keys: str) -> str:
+            for k in keys:
+                if k in fields and fields.get(k) not in (None, ""):
+                    return _safe_str(fields.get(k))
+                # case-insensitive
+                for fk, fv in fields.items():
+                    if str(fk).lower() == k.lower() and fv not in (None, ""):
+                        return _safe_str(fv)
+            return ""
+
+        nombre = pick("nombre", "name", "company", "company_name", "Company Name", "Name")
+        if not nombre:
+            continue
+        rows.append(
+            _normalize_lead_row(
+                nombre=nombre,
+                direccion=pick("direccion", "address", "Address", "location"),
+                telefono=pick("telefono", "phone", "Phone", "mobile"),
+                website=pick("website", "domain", "Website", "url", "Company Domain"),
+                rating=pick("rating", "score", "employee_count", "Employees"),
+                status_places=pick("status", "Status") or "CLAY",
+                rubro=nicho,
+                ubicacion=ubicacion or pick("ubicacion", "city", "City"),
+                email=pick("email", "Email", "work_email"),
+                linkedin=pick("linkedin", "LinkedIn", "linkedin_url"),
+                fuente=fuente,
+            )
+        )
+    return rows
+
+
+def search_clay_leads(
+    nicho: str,
+    ubicacion: str,
+    cantidad: int,
+    api_key: str,
+    webhook_url: str,
+) -> tuple[pd.DataFrame, str]:
+    """
+    Fuente Clay vía webhook de tabla/workbook.
+    Contrato esperado (flexible):
+      POST {webhook_url}
+      body: {action, nicho, ubicacion, cantidad, source}
+      response JSON: lista de leads o {leads|rows|results: [...]}
+
+    Sin webhook → muestra simulada Clay.
+    """
+    if not webhook_url:
+        return (
+            _mock_places_leads(nicho, ubicacion, cantidad, "clay_simulado"),
+            "clay_simulado",
+        )
+
+    headers = {"Content-Type": "application/json"}
+    if api_key:
+        headers["Authorization"] = f"Bearer {api_key}"
+        headers["x-clay-api-key"] = api_key
+
+    body = {
+        "action": "source_leads",
+        "nicho": nicho,
+        "ubicacion": ubicacion,
+        "cantidad": int(cantidad),
+        "source": "katem_sdr_autonomo",
+        "timestamp": _utc_now_iso(),
+    }
+
+    try:
+        resp = httpx.post(webhook_url, headers=headers, json=body, timeout=60.0)
+        if resp.status_code >= 400:
+            st.warning(
+                f"Clay webhook respondió HTTP {resp.status_code}. "
+                "Se usará extracción simulada Clay."
+            )
+            return (
+                _mock_places_leads(nicho, ubicacion, cantidad, "clay_simulado_fallback"),
+                "clay_simulado_fallback",
+            )
+
+        try:
+            payload = resp.json()
+        except Exception:
+            st.warning("Clay devolvió una respuesta no-JSON. Usando simulación.")
+            return (
+                _mock_places_leads(nicho, ubicacion, cantidad, "clay_simulado_parse"),
+                "clay_simulado_parse",
+            )
+
+        rows = _parse_clay_leads_payload(payload, nicho, ubicacion, "clay")
+        if not rows:
+            st.info("Clay no devolvió filas parseables. Generando muestra simulada.")
+            return (
+                _mock_places_leads(nicho, ubicacion, cantidad, "clay_simulado_vacio"),
+                "clay_simulado_vacio",
+            )
+        return pd.DataFrame(rows[:cantidad]), "clay"
+
+    except Exception as exc:  # noqa: BLE001
+        st.error(f"Error consultando Clay: {exc}")
+        return (
+            _mock_places_leads(nicho, ubicacion, cantidad, "clay_simulado_error"),
+            "clay_simulado_error",
+        )
+
+
+def search_leads(
+    source: str,
+    nicho: str,
+    ubicacion: str,
+    cantidad: int,
+    cfg: dict[str, str],
+) -> tuple[pd.DataFrame, str]:
+    """Dispatcher unificado de sourcing multi-fuente."""
+    source_norm = (source or "").strip().lower()
+    if source_norm.startswith("apollo"):
+        return search_apollo_organizations(nicho, ubicacion, cantidad, cfg.get("apollo_key", ""))
+    if source_norm.startswith("clay"):
+        return search_clay_leads(
+            nicho,
+            ubicacion,
+            cantidad,
+            cfg.get("clay_key", ""),
+            cfg.get("clay_webhook_url", ""),
+        )
+    # Default: Google Places
+    return search_google_places(nicho, ubicacion, cantidad, cfg.get("google_key", ""))
 
 
 # ---------------------------------------------------------------------------
@@ -855,12 +1152,32 @@ def render_sidebar() -> dict[str, str]:
     st.sidebar.markdown("### ⚙️ Configuración de APIs")
     st.sidebar.caption("Las keys se cargan desde `.env` y pueden sobreescribirse aquí (solo sesión).")
 
+    st.sidebar.markdown("#### Sourcing")
     google_key = st.sidebar.text_input(
         "Google Maps / Places Key",
         value=env_or_secret("GOOGLE_MAPS_KEY"),
         type="password",
-        help="Si está vacío, la búsqueda usa extracción simulada estructurada.",
+        help="Si está vacío, Places usa extracción simulada.",
     )
+    apollo_key = st.sidebar.text_input(
+        "Apollo.io API Key",
+        value=env_or_secret("APOLLO_API_KEY"),
+        type="password",
+        help="Organization Search de Apollo. Sin key → simulación Apollo.",
+    )
+    clay_key = st.sidebar.text_input(
+        "Clay API Key",
+        value=env_or_secret("CLAY_API_KEY"),
+        type="password",
+        help="Opcional. Se envía como Bearer al webhook de Clay.",
+    )
+    clay_webhook_url = st.sidebar.text_input(
+        "Clay Webhook URL (tabla/workbook)",
+        value=env_or_secret("CLAY_WEBHOOK_URL"),
+        help="Webhook de Clay que recibe {nicho, ubicacion, cantidad} y devuelve leads JSON.",
+    )
+
+    st.sidebar.markdown("#### Scoring / Outbound")
     openai_key = st.sidebar.text_input(
         "OpenAI API Key",
         value=env_or_secret("OPENAI_API_KEY"),
@@ -879,7 +1196,7 @@ def render_sidebar() -> dict[str, str]:
     webhook_url = st.sidebar.text_input(
         "Webhook Make / n8n",
         value=env_or_secret("WEBHOOK_URL"),
-        help="URL completa del webhook receptor.",
+        help="URL completa del webhook receptor outbound.",
     )
     campaign_id = st.sidebar.text_input(
         "Campaign ID (Instantly / Smartlead)",
@@ -896,6 +1213,9 @@ def render_sidebar() -> dict[str, str]:
 
     return {
         "google_key": google_key.strip(),
+        "apollo_key": apollo_key.strip(),
+        "clay_key": clay_key.strip(),
+        "clay_webhook_url": clay_webhook_url.strip(),
         "openai_key": openai_key.strip(),
         "anthropic_key": anthropic_key.strip(),
         "instantly_key": instantly_key.strip(),
@@ -986,11 +1306,24 @@ def render_pipeline_stepper() -> None:
 def tab_sourcing(cfg: dict[str, str]) -> None:
     st.subheader("🔍 Paso 1 — Búsqueda de Leads (Sourcing)")
     st.write(
-        "Buscá negocios por rubro y ubicación. Revisá la tabla, seleccioná cuáles "
-        "continúan al scoring y **aprobá el paso** para avanzar."
+        "Elegí la fuente (Google Places, Apollo o Clay), buscá por rubro/ubicación, "
+        "revisá la tabla, seleccioná leads y **aprobá el paso** para avanzar."
     )
 
     with st.form("form_sourcing"):
+        fuente = st.selectbox(
+            "Fuente de extracción",
+            [
+                "Google Places",
+                "Apollo.io",
+                "Clay (webhook)",
+            ],
+            help=(
+                "Google Places: negocios locales. "
+                "Apollo: organizaciones B2B en la base de Apollo. "
+                "Clay: webhook de tu tabla/workbook Clay."
+            ),
+        )
         c1, c2, c3 = st.columns([2, 2, 1])
         with c1:
             nicho = st.text_input("Rubro / Nicho", value="estudios contables")
@@ -998,19 +1331,40 @@ def tab_sourcing(cfg: dict[str, str]) -> None:
             ubicacion = st.text_input("Ubicación", value="Pilar")
         with c3:
             cantidad = st.number_input("Cantidad", min_value=1, max_value=60, value=8, step=1)
+
+        if fuente.startswith("Clay"):
+            st.caption(
+                "Clay espera un webhook que reciba "
+                "`{nicho, ubicacion, cantidad}` y responda JSON con leads "
+                "(`nombre/name`, `website/domain`, `telefono/phone`, etc.)."
+            )
+        elif fuente.startswith("Apollo"):
+            st.caption(
+                "Apollo usa Organization Search. Sin `APOLLO_API_KEY` se genera una muestra simulada."
+            )
+        else:
+            st.caption(
+                "Google Places. Sin `GOOGLE_MAPS_KEY` se genera extracción simulada estructurada."
+            )
+
         submitted = st.form_submit_button("Buscar leads", type="primary", use_container_width=True)
 
     if submitted:
         if not nicho.strip() or not ubicacion.strip():
             st.error("Completá rubro y ubicación.")
         else:
-            with st.spinner("Consultando fuentes de leads…"):
-                df, mode = search_google_places(
+            with st.spinner(f"Consultando {fuente}…"):
+                df, mode = search_leads(
+                    fuente,
                     nicho.strip(),
                     ubicacion.strip(),
                     int(cantidad),
-                    cfg["google_key"],
+                    cfg,
                 )
+            # Asegurar columnas opcionales de Apollo/Clay
+            for col in ("email", "linkedin", "fuente"):
+                if col not in df.columns:
+                    df[col] = ""
             st.session_state.sourced_leads = df
             st.session_state.step1_approved = False
             st.session_state.pipeline_step = 1
@@ -1018,10 +1372,14 @@ def tab_sourcing(cfg: dict[str, str]) -> None:
                 "nicho": nicho,
                 "ubicacion": ubicacion,
                 "cantidad": int(cantidad),
+                "source": fuente,
                 "mode": mode,
                 "at": _utc_now_iso(),
             }
-            st.success(f"Se obtuvieron {len(df)} leads · modo: `{mode}` — revisalos antes de avanzar.")
+            st.success(
+                f"Se obtuvieron {len(df)} leads · fuente: `{fuente}` · modo: `{mode}` — "
+                "revisalos antes de avanzar."
+            )
 
     df = st.session_state.sourced_leads
     meta = st.session_state.last_search_meta
@@ -1046,7 +1404,10 @@ def tab_sourcing(cfg: dict[str, str]) -> None:
             column_config={
                 "seleccionado": st.column_config.CheckboxColumn("Seleccionar", default=False),
                 "website": st.column_config.LinkColumn("Sitio Web"),
-                "rating": st.column_config.TextColumn("Rating"),
+                "linkedin": st.column_config.LinkColumn("LinkedIn"),
+                "rating": st.column_config.TextColumn("Rating / Señal"),
+                "fuente": st.column_config.TextColumn("Fuente"),
+                "email": st.column_config.TextColumn("Email"),
             },
             disabled=[c for c in editable.columns if c != "seleccionado"],
             key="editor_sourcing",
@@ -1759,7 +2120,7 @@ _SUGERENCIAS_MEJORA_Y_ARQUITECTURA_FUTURA = """
 SUGERENCIAS DE MEJORA Y ARQUITECTURA FUTURA
 -------------------------------------------
 1) Cache y performance
-   - Envolver search_google_places y lecturas de CRM con @st.cache_data(ttl=300)
+   - Envolver search_leads (Places/Apollo/Clay) y lecturas de CRM con @st.cache_data(ttl=300)
      para evitar reconsultas costosas a Places en cada rerun de Streamlit.
    - Separar el estado mutable (selección, logs) del cache de datos de solo lectura.
 
@@ -1801,6 +2162,9 @@ _ENV_EXAMPLE = """
 OPENAI_API_KEY=sk-proj-xxxxxxxxxxxxxxxxxxxxxxxx
 ANTHROPIC_API_KEY=sk-ant-xxxxxxxxxxxxxxxxxxxxxxxx
 GOOGLE_MAPS_KEY=AIzaxxxxxxxxxxxxxxxxxxxxxxxx
+APOLLO_API_KEY=apollo_xxxxxxxxxxxxxxxxxxxxxxxx
+CLAY_API_KEY=clay_xxxxxxxxxxxxxxxxxxxxxxxx
+CLAY_WEBHOOK_URL=https://api.clay.com/v1/webhooks/xxxxxxxx
 INSTANTLY_API_KEY=instantly_xxxxxxxxxxxxxxxxxx
 SMARTLEAD_API_KEY=
 INSTANTLY_CAMPAIGN_ID=campaign_xxxxxxxx
