@@ -1,0 +1,9 @@
+__pycache__/
+*.pyc
+.venv/
+.env
+leads_crm.csv
+dispatch_log.csv
+.streamlit/secrets.toml
+*.xlsx
+.DS_Store

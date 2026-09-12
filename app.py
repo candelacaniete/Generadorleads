@@ -1399,9 +1399,11 @@ if __name__ == "__main__":
 
 
 # =============================================================================
-# SUGERENCIAS DE MEJORA Y ARQUITECTURA FUTURA
+# Documentación embebida (asignada a variables para que Streamlit Magic
+# NO las renderice en la UI; el contenido queda en el código fuente).
 # =============================================================================
-"""
+
+_SUGERENCIAS_MEJORA_Y_ARQUITECTURA_FUTURA = """
 SUGERENCIAS DE MEJORA Y ARQUITECTURA FUTURA
 -------------------------------------------
 1) Cache y performance
@@ -1432,11 +1434,7 @@ SUGERENCIAS DE MEJORA Y ARQUITECTURA FUTURA
      y webhooks entrantes desde Cal.com para marcar "Agendado" automáticamente.
 """
 
-
-# =============================================================================
-# requirements.txt (contenido exacto sugerido)
-# =============================================================================
-"""
+_REQUIREMENTS_TXT = """
 # ----- requirements.txt -----
 streamlit>=1.32.0
 pandas>=2.1.0
@@ -1446,11 +1444,7 @@ python-dotenv>=1.0.0
 openpyxl>=3.1.0
 """
 
-
-# =============================================================================
-# .env (ejemplo)
-# =============================================================================
-"""
+_ENV_EXAMPLE = """
 # ----- .env.example -----
 OPENAI_API_KEY=sk-proj-xxxxxxxxxxxxxxxxxxxxxxxx
 ANTHROPIC_API_KEY=sk-ant-xxxxxxxxxxxxxxxxxxxxxxxx
