@@ -2018,25 +2018,82 @@ def _heuristic_pain_from_text(lead: dict[str, Any], site: dict[str, Any]) -> dic
     }
 
 
-def extract_pains_with_claude(
-    lead: dict[str, Any],
-    site: dict[str, Any],
-    api_key: str,
-    model: str = "claude-3-5-haiku-20241022",
-) -> dict[str, str]:
-    """Usa Claude para resumir el sitio y proponer dolores + icebreaker."""
-    if not api_key:
-        return _heuristic_pain_from_text(lead, site)
-    if not site.get("ok"):
-        return _heuristic_pain_from_text(lead, site)
-
-    user_content = (
+def _pain_user_prompt(lead: dict[str, Any], site: dict[str, Any]) -> str:
+    return (
         f"{_client_offer_context()}\n\n"
         f"Lead:\n{json.dumps({k: lead.get(k) for k in ('nombre','rubro','ubicacion','website','email','telefono')}, ensure_ascii=False, indent=2)}\n\n"
         f"Título detectado: {site.get('title')}\n"
         f"URLs leídas: {site.get('fuente_urls')}\n\n"
         f"Texto del sitio:\n{site.get('text')}"
     )
+
+
+def _pains_from_parsed(parsed: dict[str, Any], site: dict[str, Any], status: str) -> dict[str, str]:
+    dolores = parsed.get("dolores") or []
+    if isinstance(dolores, list):
+        dolores_txt = " | ".join(_safe_str(x) for x in dolores if _safe_str(x))
+    else:
+        dolores_txt = _safe_str(dolores)
+    return {
+        "website_summary": _safe_str(parsed.get("website_summary")),
+        "dolores": dolores_txt,
+        "angulo_email": _safe_str(parsed.get("angulo_email")),
+        "icebreaker": _safe_str(parsed.get("icebreaker")),
+        "scrape_status": status,
+        "scrape_fuente": _safe_str(site.get("fuente_urls")),
+    }
+
+
+def extract_pains_with_openai(
+    lead: dict[str, Any],
+    site: dict[str, Any],
+    api_key: str,
+    model: str = "gpt-4o-mini",
+) -> dict[str, str]:
+    """Usa OpenAI para resumir el sitio y proponer dolores + icebreaker."""
+    if not api_key or not site.get("ok"):
+        return _heuristic_pain_from_text(lead, site)
+
+    url = "https://api.openai.com/v1/chat/completions"
+    headers = {
+        "Authorization": f"Bearer {api_key}",
+        "Content-Type": "application/json",
+    }
+    body = {
+        "model": model or "gpt-4o-mini",
+        "temperature": 0.3,
+        "response_format": {"type": "json_object"},
+        "messages": [
+            {"role": "system", "content": PAIN_EXTRACTION_SYSTEM},
+            {"role": "user", "content": _pain_user_prompt(lead, site)},
+        ],
+    }
+    try:
+        resp = requests.post(url, headers=headers, json=body, timeout=90)
+        resp.raise_for_status()
+        content = resp.json()["choices"][0]["message"]["content"]
+        parsed = _extract_json_object(content)
+        if not parsed:
+            out = _heuristic_pain_from_text(lead, site)
+            out["scrape_status"] = "openai_parse_fallback"
+            return out
+        return _pains_from_parsed(parsed, site, "ok_openai")
+    except Exception as exc:  # noqa: BLE001
+        out = _heuristic_pain_from_text(lead, site)
+        out["scrape_status"] = f"openai_error_fallback:{exc}"
+        return out
+
+
+def extract_pains_with_claude(
+    lead: dict[str, Any],
+    site: dict[str, Any],
+    api_key: str,
+    model: str = "claude-3-5-haiku-latest",
+) -> dict[str, str]:
+    """Usa Claude para resumir el sitio y proponer dolores + icebreaker."""
+    if not api_key or not site.get("ok"):
+        return _heuristic_pain_from_text(lead, site)
+
     url = "https://api.anthropic.com/v1/messages"
     headers = {
         "x-api-key": api_key,
@@ -2044,11 +2101,11 @@ def extract_pains_with_claude(
         "Content-Type": "application/json",
     }
     body = {
-        "model": model,
+        "model": model or "claude-3-5-haiku-latest",
         "max_tokens": 900,
         "temperature": 0.3,
         "system": PAIN_EXTRACTION_SYSTEM,
-        "messages": [{"role": "user", "content": user_content}],
+        "messages": [{"role": "user", "content": _pain_user_prompt(lead, site)}],
     }
     try:
         resp = requests.post(url, headers=headers, json=body, timeout=90)
@@ -2061,19 +2118,7 @@ def extract_pains_with_claude(
             out = _heuristic_pain_from_text(lead, site)
             out["scrape_status"] = "claude_parse_fallback"
             return out
-        dolores = parsed.get("dolores") or []
-        if isinstance(dolores, list):
-            dolores_txt = " | ".join(_safe_str(x) for x in dolores if _safe_str(x))
-        else:
-            dolores_txt = _safe_str(dolores)
-        return {
-            "website_summary": _safe_str(parsed.get("website_summary")),
-            "dolores": dolores_txt,
-            "angulo_email": _safe_str(parsed.get("angulo_email")),
-            "icebreaker": _safe_str(parsed.get("icebreaker")),
-            "scrape_status": "ok_claude",
-            "scrape_fuente": _safe_str(site.get("fuente_urls")),
-        }
+        return _pains_from_parsed(parsed, site, "ok_claude")
     except Exception as exc:  # noqa: BLE001
         out = _heuristic_pain_from_text(lead, site)
         out["scrape_status"] = f"claude_error_fallback:{exc}"
@@ -2082,11 +2127,14 @@ def extract_pains_with_claude(
 
 def research_one_lead(
     lead: dict[str, Any],
-    anthropic_key: str,
-    model: str = "claude-3-5-haiku-20241022",
-    use_claude: bool = True,
+    *,
+    provider: str = "Heurística local",
+    openai_key: str = "",
+    anthropic_key: str = "",
+    openai_model: str = "gpt-4o-mini",
+    anthropic_model: str = "claude-3-5-haiku-latest",
 ) -> dict[str, Any]:
-    """Scrape del website + extracción de dolores (Claude o heurística)."""
+    """Scrape del website + extracción de dolores (OpenAI / Claude / heurística)."""
     out = dict(lead)
     website = _safe_str(lead.get("website"))
     site = fetch_website_text(website) if website else {
@@ -2097,28 +2145,42 @@ def research_one_lead(
         "error": "sin_website",
         "fuente_urls": "",
     }
-    if use_claude and anthropic_key and site.get("ok"):
-        pains = extract_pains_with_claude(out, site, anthropic_key, model)
+
+    prov = (provider or "").lower()
+    if site.get("ok") and ("openai" in prov or "gpt" in prov) and openai_key:
+        pains = extract_pains_with_openai(out, site, openai_key, openai_model)
+    elif site.get("ok") and ("anthropic" in prov or "claude" in prov) and anthropic_key:
+        pains = extract_pains_with_claude(out, site, anthropic_key, anthropic_model)
     else:
         pains = _heuristic_pain_from_text(out, site)
-        if not anthropic_key and site.get("ok"):
-            pains["scrape_status"] = "ok_heuristica_sin_claude"
+        if site.get("ok"):
+            pains["scrape_status"] = "ok_heuristica"
     out.update(pains)
     return out
 
 
 def research_leads_batch(
     leads_df: pd.DataFrame,
+    *,
+    provider: str,
+    openai_key: str,
     anthropic_key: str,
-    model: str,
-    use_claude: bool,
+    openai_model: str,
+    anthropic_model: str,
 ) -> pd.DataFrame:
     rows: list[dict[str, Any]] = []
     total = max(len(leads_df), 1)
     progress = st.progress(0.0, text="Scrapeando sitios y extrayendo dolores…")
     for idx, (_, row) in enumerate(leads_df.iterrows()):
         rows.append(
-            research_one_lead(row.to_dict(), anthropic_key, model, use_claude=use_claude)
+            research_one_lead(
+                row.to_dict(),
+                provider=provider,
+                openai_key=openai_key,
+                anthropic_key=anthropic_key,
+                openai_model=openai_model,
+                anthropic_model=anthropic_model,
+            )
         )
         progress.progress(
             (idx + 1) / total,
@@ -2126,6 +2188,7 @@ def research_leads_batch(
         )
     progress.empty()
     return pd.DataFrame(rows)
+
 
 
 def upsert_researched_lead(lead: dict[str, Any]) -> None:
@@ -2305,7 +2368,7 @@ def score_lead_openai(lead: dict[str, Any], api_key: str, model: str = "gpt-4o")
 def score_lead_anthropic(
     lead: dict[str, Any],
     api_key: str,
-    model: str = "claude-3-5-sonnet-20241022",
+    model: str = "claude-3-5-sonnet-latest",
 ) -> dict[str, str]:
     user_content = (
         "Califica este lead B2B y responde solo JSON:\n"
@@ -2349,12 +2412,27 @@ def score_one_lead(
 ) -> dict[str, Any]:
     """Califica un único lead (modo supervisado o lote)."""
     try:
-        if provider == "OpenAI (GPT-4o)" and openai_key:
-            scored = score_lead_openai(lead, openai_key, openai_model)
+        prov = (provider or "").lower()
+        if ("openai" in prov or "gpt" in prov) and openai_key:
+            scored = score_lead_openai(lead, openai_key, openai_model or "gpt-4o")
             scored["scoring_fuente"] = "openai"
-        elif provider == "Anthropic (Claude)" and anthropic_key:
-            scored = score_lead_anthropic(lead, anthropic_key, anthropic_model)
+        elif ("anthropic" in prov or "claude" in prov) and anthropic_key:
+            scored = score_lead_anthropic(
+                lead, anthropic_key, anthropic_model or "claude-3-5-sonnet-latest"
+            )
             scored["scoring_fuente"] = "anthropic"
+        elif ("openai" in prov or "gpt" in prov) and not openai_key:
+            scored = _heuristic_score(lead)
+            scored["scoring_fuente"] = "heuristica_sin_openai_key"
+            scored["score_razon"] = (
+                f"[Sin OPENAI_API_KEY] {scored['score_razon']}"
+            )
+        elif ("anthropic" in prov or "claude" in prov) and not anthropic_key:
+            scored = _heuristic_score(lead)
+            scored["scoring_fuente"] = "heuristica_sin_anthropic_key"
+            scored["score_razon"] = (
+                f"[Sin ANTHROPIC_API_KEY] {scored['score_razon']}"
+            )
         else:
             scored = _heuristic_score(lead)
             scored["scoring_fuente"] = "heuristica_local"
@@ -3341,18 +3419,29 @@ def tab_research(cfg: dict[str, str]) -> None:
         st.warning("No hay leads para investigar.")
         return
 
+    st.info(
+        "Este paso scrapea el website y genera dolores/icebreaker. "
+        "**No es Enrichment** (email/LinkedIn). Si elegís GPT acá, no se llama a Anthropic."
+    )
+    default_provider = (
+        "OpenAI (GPT)"
+        if cfg.get("openai_key")
+        else ("Anthropic (Claude)" if cfg.get("anthropic_key") else "Heurística local")
+    )
     c1, c2, c3 = st.columns(3)
     with c1:
-        use_claude = st.checkbox(
-            "Usar Claude para dolores",
-            value=bool(cfg.get("anthropic_key")),
-            help="Sin ANTHROPIC_API_KEY → heurística local sobre el texto scrapeado.",
+        research_provider = st.selectbox(
+            "IA para dolores",
+            ["OpenAI (GPT)", "Anthropic (Claude)", "Heurística local"],
+            index=["OpenAI (GPT)", "Anthropic (Claude)", "Heurística local"].index(default_provider),
+            help="Enrichment usa Hunter/Snov/Clay. Acá elegís GPT o Claude solo para leer el sitio.",
         )
     with c2:
+        openai_research_model = st.text_input("Modelo OpenAI", value="gpt-4o-mini")
         claude_model = st.text_input(
-            "Modelo Claude (research)",
-            value="claude-3-5-haiku-20241022",
-            help="Haiku es barato para research; Sonnet si querés más calidad.",
+            "Modelo Claude",
+            value="claude-3-5-haiku-latest",
+            help="Usá IDs actuales (`…-latest`). Modelos viejos pueden devolver HTTP 404.",
         )
     with c3:
         mode = st.radio(
@@ -3362,8 +3451,10 @@ def tab_research(cfg: dict[str, str]) -> None:
         )
     st.session_state.scrape_mode = mode
     st.metric("Leads en cola", len(base))
-    if use_claude and not cfg.get("anthropic_key"):
-        st.info("Sin `ANTHROPIC_API_KEY`: se scrapeá el sitio y se usan dolores heurísticos.")
+    if research_provider.startswith("OpenAI") and not cfg.get("openai_key"):
+        st.warning("Elegiste GPT pero no hay `OPENAI_API_KEY` → se usará heurística.")
+    if research_provider.startswith("Anthropic") and not cfg.get("anthropic_key"):
+        st.warning("Elegiste Claude pero no hay `ANTHROPIC_API_KEY` → se usará heurística.")
 
     # ---- Uno a uno ----
     if mode.startswith("Uno a uno"):
@@ -3402,9 +3493,11 @@ def tab_research(cfg: dict[str, str]) -> None:
                 ):
                     result = research_one_lead(
                         lead,
-                        cfg.get("anthropic_key", ""),
-                        claude_model.strip() or "claude-3-5-haiku-20241022",
-                        use_claude=use_claude,
+                        provider=research_provider,
+                        openai_key=cfg.get("openai_key", ""),
+                        anthropic_key=cfg.get("anthropic_key", ""),
+                        openai_model=openai_research_model.strip() or "gpt-4o-mini",
+                        anthropic_model=claude_model.strip() or "claude-3-5-haiku-latest",
                     )
                     st.session_state.scrape_current_result = result
                     upsert_researched_lead(result)
@@ -3459,7 +3552,7 @@ def tab_research(cfg: dict[str, str]) -> None:
                     st.rerun()
     else:
         confirm_batch = st.checkbox(
-            f"Confirmo scrapear y analizar {len(base)} sitios (Claude={use_claude})",
+            f"Confirmo scrapear y analizar {len(base)} sitios (IA={research_provider})",
             key="confirm_research_batch",
         )
         if st.button(
@@ -3471,9 +3564,11 @@ def tab_research(cfg: dict[str, str]) -> None:
         ):
             out = research_leads_batch(
                 base,
-                cfg.get("anthropic_key", ""),
-                claude_model.strip() or "claude-3-5-haiku-20241022",
-                use_claude,
+                provider=research_provider,
+                openai_key=cfg.get("openai_key", ""),
+                anthropic_key=cfg.get("anthropic_key", ""),
+                openai_model=openai_research_model.strip() or "gpt-4o-mini",
+                anthropic_model=claude_model.strip() or "claude-3-5-haiku-latest",
             )
             st.session_state.researched_leads = out
             for _, row in out.iterrows():
@@ -3583,7 +3678,7 @@ def tab_scoring(cfg: dict[str, str]) -> None:
     with c2:
         openai_model = st.text_input("Modelo OpenAI", value="gpt-4o")
     with c3:
-        anthropic_model = st.text_input("Modelo Anthropic", value="claude-3-5-sonnet-20241022")
+        anthropic_model = st.text_input("Modelo Anthropic", value="claude-3-5-sonnet-latest")
 
     mode = st.radio(
         "Modo de ejecución",
@@ -3636,7 +3731,7 @@ def tab_scoring(cfg: dict[str, str]) -> None:
                         openai_key=cfg["openai_key"],
                         anthropic_key=cfg["anthropic_key"],
                         openai_model=openai_model.strip() or "gpt-4o",
-                        anthropic_model=anthropic_model.strip() or "claude-3-5-sonnet-20241022",
+                        anthropic_model=anthropic_model.strip() or "claude-3-5-sonnet-latest",
                     )
                     st.session_state.scoring_current_result = result
             with b2:
@@ -3698,7 +3793,7 @@ def tab_scoring(cfg: dict[str, str]) -> None:
                 openai_key=cfg["openai_key"],
                 anthropic_key=cfg["anthropic_key"],
                 openai_model=openai_model.strip() or "gpt-4o",
-                anthropic_model=anthropic_model.strip() or "claude-3-5-sonnet-20241022",
+                anthropic_model=anthropic_model.strip() or "claude-3-5-sonnet-latest",
             )
             st.session_state.scored_leads = scored
             st.session_state.high_leads = scored[scored["lead_score"] == "High"].copy()
