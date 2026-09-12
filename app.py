@@ -712,22 +712,102 @@ def search_apollo_organizations(
 # ---------------------------------------------------------------------------
 # Integración: Clay — Webhook / API de tabla
 # ---------------------------------------------------------------------------
+def _coerce_http_json(resp: httpx.Response) -> tuple[Any | None, str]:
+    """
+    Intenta obtener JSON aunque el Content-Type sea raro.
+    Clay Monitor webhook suele devolver vacío / HTML / 'OK' (no lista de leads).
+    Make/n8n sí pueden devolver JSON con leads.
+    Retorna (payload|None, motivo).
+    """
+    raw = (resp.text or "").strip()
+    if not raw:
+        return None, "cuerpo_vacio"
+
+    try:
+        return resp.json(), ""
+    except Exception:
+        pass
+
+    cleaned = raw.lstrip("\ufeff").strip()
+    if cleaned.lower() in {"ok", "success", "true", "received", "accepted"}:
+        return None, "ack_sin_leads"
+
+    for opener, closer in (("{", "}"), ("[", "]")):
+        start_i = cleaned.find(opener)
+        end_i = cleaned.rfind(closer)
+        if start_i >= 0 and end_i > start_i:
+            snippet = cleaned[start_i : end_i + 1]
+            try:
+                return json.loads(snippet), ""
+            except json.JSONDecodeError:
+                continue
+
+    ctype = (resp.headers.get("content-type") or "").lower()
+    if (
+        "html" in ctype
+        or cleaned[:15].lower().startswith("<!doctype")
+        or cleaned[:6].lower().startswith("<html")
+    ):
+        return None, "html_no_json"
+    return None, "no_json"
+
+
+def _clay_response_preview(resp: httpx.Response, limit: int = 280) -> str:
+    body = (resp.text or "").replace("\n", " ").strip()
+    if not body:
+        return "(vacío)"
+    if len(body) > limit:
+        return body[:limit] + "…"
+    return body
+
+
 def _parse_clay_leads_payload(payload: Any, nicho: str, ubicacion: str, fuente: str) -> list[dict[str, Any]]:
-    """Normaliza respuestas típicas de Clay (lista, {leads|rows|results|data})."""
+    """Normaliza respuestas típicas de Clay/Make/n8n (lista, {leads|rows|results|data})."""
     items: list[Any]
     if isinstance(payload, list):
         items = payload
     elif isinstance(payload, dict):
+        ack_only = set(payload.keys()) <= {
+            "received",
+            "success",
+            "ok",
+            "status",
+            "message",
+            "id",
+        }
+        if ack_only and not any(
+            k in payload for k in ("leads", "rows", "results", "data", "records", "items")
+        ):
+            return []
+
+        nested = payload.get("output") or payload.get("body") or payload.get("json")
+        if isinstance(nested, (list, dict)) and not any(
+            k in payload for k in ("leads", "rows", "results", "data", "records")
+        ):
+            return _parse_clay_leads_payload(nested, nicho, ubicacion, fuente)
+
         items = (
             payload.get("leads")
             or payload.get("rows")
             or payload.get("results")
             or payload.get("data")
             or payload.get("records")
+            or payload.get("items")
             or []
         )
         if isinstance(items, dict):
-            items = items.get("rows") or items.get("items") or []
+            items = (
+                items.get("rows")
+                or items.get("items")
+                or items.get("leads")
+                or items.get("results")
+                or []
+            )
+        # Un solo lead como objeto plano
+        if not items and any(
+            str(k).lower() in {"nombre", "name", "company", "company_name"} for k in payload.keys()
+        ):
+            items = [payload]
     else:
         items = []
 
@@ -735,8 +815,7 @@ def _parse_clay_leads_payload(payload: Any, nicho: str, ubicacion: str, fuente: 
     for item in items:
         if not isinstance(item, dict):
             continue
-        # Clay suele anidar campos en "fields" / "cells"
-        fields = item.get("fields") or item.get("cells") or item
+        fields = item.get("fields") or item.get("cells") or item.get("properties") or item
         if not isinstance(fields, dict):
             continue
 
@@ -744,27 +823,48 @@ def _parse_clay_leads_payload(payload: Any, nicho: str, ubicacion: str, fuente: 
             for k in keys:
                 if k in fields and fields.get(k) not in (None, ""):
                     return _safe_str(fields.get(k))
-                # case-insensitive
                 for fk, fv in fields.items():
                     if str(fk).lower() == k.lower() and fv not in (None, ""):
                         return _safe_str(fv)
             return ""
 
-        nombre = pick("nombre", "name", "company", "company_name", "Company Name", "Name")
+        nombre = pick(
+            "nombre",
+            "name",
+            "company",
+            "company_name",
+            "Company Name",
+            "Name",
+            "organization_name",
+            "Org Name",
+        )
         if not nombre:
             continue
         rows.append(
             _normalize_lead_row(
                 nombre=nombre,
-                direccion=pick("direccion", "address", "Address", "location"),
-                telefono=pick("telefono", "phone", "Phone", "mobile"),
-                website=pick("website", "domain", "Website", "url", "Company Domain"),
+                direccion=pick("direccion", "address", "Address", "location", "full_address"),
+                telefono=pick("telefono", "phone", "Phone", "mobile", "Mobile Phone"),
+                website=pick(
+                    "website",
+                    "domain",
+                    "Website",
+                    "url",
+                    "Company Domain",
+                    "company_domain",
+                ),
                 rating=pick("rating", "score", "employee_count", "Employees"),
                 status_places=pick("status", "Status") or "CLAY",
                 rubro=nicho,
-                ubicacion=ubicacion or pick("ubicacion", "city", "City"),
-                email=pick("email", "Email", "work_email"),
-                linkedin=pick("linkedin", "LinkedIn", "linkedin_url"),
+                ubicacion=ubicacion or pick("ubicacion", "city", "City", "location"),
+                email=pick("email", "Email", "work_email", "Work Email"),
+                linkedin=pick(
+                    "linkedin",
+                    "LinkedIn",
+                    "linkedin_url",
+                    "company_linkedin",
+                    "LinkedIn URL",
+                ),
                 fuente=fuente,
             )
         )
@@ -779,13 +879,11 @@ def search_clay_leads(
     webhook_url: str,
 ) -> tuple[pd.DataFrame, str]:
     """
-    Fuente Clay vía webhook de tabla/workbook.
-    Contrato esperado (flexible):
-      POST {webhook_url}
-      body: {action, nicho, ubicacion, cantidad, source}
-      response JSON: lista de leads o {leads|rows|results: [...]}
+    Fuente Clay vía webhook (idealmente Make/n8n que lea Clay y responda JSON).
 
-    Sin webhook → muestra simulada Clay.
+    El *Monitor webhook* nativo de Clay solo RECIBE filas hacia Clay y suele
+    responder vacío/HTML/ACK — no devuelve leads. Para sourcing síncrono usá
+    Make/n8n/Zapier que consulte Clay y responda JSON con leads.
     """
     if not webhook_url:
         return (
@@ -793,16 +891,22 @@ def search_clay_leads(
             "clay_simulado",
         )
 
-    headers = {"Content-Type": "application/json"}
+    headers = {
+        "Content-Type": "application/json",
+        "Accept": "application/json",
+    }
     if api_key:
         headers["Authorization"] = f"Bearer {api_key}"
         headers["x-clay-api-key"] = api_key
+        headers["x-api-key"] = api_key
 
     body = {
         "action": "source_leads",
         "nicho": nicho,
         "ubicacion": ubicacion,
         "cantidad": int(cantidad),
+        "limit": int(cantidad),
+        "query": f"{nicho} {ubicacion}".strip(),
         "source": "katem_sdr_autonomo",
         "timestamp": _utc_now_iso(),
     }
@@ -811,26 +915,48 @@ def search_clay_leads(
         resp = httpx.post(webhook_url, headers=headers, json=body, timeout=60.0)
         if resp.status_code >= 400:
             st.warning(
-                f"Clay webhook respondió HTTP {resp.status_code}. "
-                "Se usará extracción simulada Clay."
+                f"Webhook Clay/Make respondió HTTP {resp.status_code}. "
+                f"Preview: `{_clay_response_preview(resp)}`. Usando simulación."
             )
             return (
                 _mock_places_leads(nicho, ubicacion, cantidad, "clay_simulado_fallback"),
                 "clay_simulado_fallback",
             )
 
-        try:
-            payload = resp.json()
-        except Exception:
-            st.warning("Clay devolvió una respuesta no-JSON. Usando simulación.")
+        payload, reason = _coerce_http_json(resp)
+        if payload is None:
+            tip = (
+                "El Monitor webhook de Clay **no devuelve leads** (solo ACK). "
+                "Usá un webhook **Make/n8n** que lea la tabla Clay y responda "
+                "`{leads:[{nombre,website,email,linkedin,...}]}`."
+                if reason in {"cuerpo_vacio", "ack_sin_leads", "html_no_json"}
+                else "La URL debe responder JSON con leads."
+            )
+            st.warning(
+                f"Clay/Make no devolvió JSON usable (`{reason}`). {tip} "
+                f"Preview: `{_clay_response_preview(resp)}`"
+            )
+            with st.expander("Detalle respuesta webhook", expanded=False):
+                st.code(
+                    f"HTTP {resp.status_code}\n"
+                    f"Content-Type: {resp.headers.get('content-type', '')}\n"
+                    f"Body:\n{_clay_response_preview(resp, 1200)}"
+                )
             return (
-                _mock_places_leads(nicho, ubicacion, cantidad, "clay_simulado_parse"),
-                "clay_simulado_parse",
+                _mock_places_leads(nicho, ubicacion, cantidad, f"clay_simulado_{reason}"),
+                f"clay_simulado_{reason}",
             )
 
         rows = _parse_clay_leads_payload(payload, nicho, ubicacion, "clay")
         if not rows:
-            st.info("Clay no devolvió filas parseables. Generando muestra simulada.")
+            st.warning(
+                "El webhook respondió JSON pero **sin filas de leads parseables**. "
+                "Esperado: `[{nombre, website, ...}]` o `{leads|rows|results: [...]}`. "
+                "Si usás Monitor webhook de Clay, cambiá a Make/n8n que exporte la tabla."
+            )
+            with st.expander("JSON recibido", expanded=False):
+                preview = payload[:20] if isinstance(payload, list) else payload
+                st.json(preview)
             return (
                 _mock_places_leads(nicho, ubicacion, cantidad, "clay_simulado_vacio"),
                 "clay_simulado_vacio",
@@ -838,7 +964,7 @@ def search_clay_leads(
         return pd.DataFrame(rows[:cantidad]), "clay"
 
     except Exception as exc:  # noqa: BLE001
-        st.error(f"Error consultando Clay: {exc}")
+        st.error(f"Error consultando Clay/Make: {exc}")
         return (
             _mock_places_leads(nicho, ubicacion, cantidad, "clay_simulado_error"),
             "clay_simulado_error",
@@ -1435,10 +1561,14 @@ def enrich_linkedin_via_clay(
             )
         return out
 
-    headers = {"Content-Type": "application/json"}
+    headers = {
+        "Content-Type": "application/json",
+        "Accept": "application/json",
+    }
     if api_key:
         headers["Authorization"] = f"Bearer {api_key}"
         headers["x-clay-api-key"] = api_key
+        headers["x-api-key"] = api_key
     body = {
         "action": "enrich_linkedin",
         "lead": {
@@ -1455,8 +1585,12 @@ def enrich_linkedin_via_clay(
     try:
         resp = httpx.post(webhook_url, headers=headers, json=body, timeout=60.0)
         if resp.status_code >= 400:
-            raise RuntimeError(f"Clay LinkedIn HTTP {resp.status_code}")
-        payload = resp.json()
+            raise RuntimeError(
+                f"Clay LinkedIn HTTP {resp.status_code}: {_clay_response_preview(resp, 160)}"
+            )
+        payload, reason = _coerce_http_json(resp)
+        if payload is None:
+            raise RuntimeError(f"Clay LinkedIn no-JSON ({reason}): {_clay_response_preview(resp, 160)}")
         # Normalizar
         linkedin = ""
         if isinstance(payload, dict):
@@ -1466,7 +1600,6 @@ def enrich_linkedin_via_clay(
                 or payload.get("company_linkedin")
                 or (payload.get("lead") or {}).get("linkedin")
             )
-            # rows[0]
             if not linkedin:
                 rows = payload.get("rows") or payload.get("leads") or payload.get("results") or []
                 if rows and isinstance(rows[0], dict):
@@ -1485,7 +1618,7 @@ def enrich_linkedin_via_clay(
     except Exception as exc:  # noqa: BLE001
         out = enrich_linkedin_via_clay(lead, "", "")
         out["enrichment_fuente"] = (
-            (_safe_str(out.get("enrichment_fuente")) + f"+clay_linkedin_error").strip("+")
+            (_safe_str(out.get("enrichment_fuente")) + "+clay_linkedin_error").strip("+")
         )
         out["notas"] = (_safe_str(out.get("notas")) + f" | Clay LI error: {exc}")[:300]
     return out
@@ -2489,9 +2622,13 @@ def render_sidebar() -> dict[str, str]:
         type="password",
     )
     clay_webhook_url = st.sidebar.text_input(
-        "Clay Webhook URL (sourcing)",
+        "Clay / Make webhook (sourcing)",
         value=env_or_secret("CLAY_WEBHOOK_URL"),
-        help="Webhook Clay para buscar/traer leads.",
+        help=(
+            "URL que responde JSON con leads. "
+            "El Monitor webhook nativo de Clay NO sirve (solo ACK). "
+            "Usá Make/n8n que lea Clay y responda {leads:[...]}."
+        ),
     )
     serpapi_key = st.sidebar.text_input(
         "SerpAPI Key (Google Maps)",
@@ -2543,9 +2680,12 @@ def render_sidebar() -> dict[str, str]:
         type="password",
     )
     clay_linkedin_webhook = st.sidebar.text_input(
-        "Clay Webhook URL (LinkedIn enrich)",
+        "Clay / Make webhook (LinkedIn enrich)",
         value=env_or_secret("CLAY_LINKEDIN_WEBHOOK_URL") or env_or_secret("CLAY_WEBHOOK_URL"),
-        help="Webhook Clay con action=enrich_linkedin. Sin URL → LinkedIn heurístico.",
+        help=(
+            "Webhook Make/n8n que responda JSON `{linkedin:\"https://...\"}`. "
+            "Monitor Clay nativo no devuelve LinkedIn síncrono. Sin URL → heurística."
+        ),
     )
 
     st.sidebar.markdown("#### Scoring / Outbound")
@@ -2721,7 +2861,11 @@ def tab_sourcing(cfg: dict[str, str]) -> None:
             )
 
         if fuente.startswith("Clay"):
-            st.caption("Clay webhook: `{nicho, ubicacion, cantidad}` → JSON leads.")
+            st.caption(
+                "Clay vía Make/n8n: POST `{nicho, ubicacion, cantidad}` → "
+                "JSON `{leads:[{nombre, website, email, linkedin, ...}]}`. "
+                "Monitor webhook nativo de Clay solo ACK → cae a simulación."
+            )
         elif fuente.startswith("Apollo"):
             st.caption("Apollo Organization Search. Sin key → simulación.")
         elif fuente.startswith("SerpAPI"):
