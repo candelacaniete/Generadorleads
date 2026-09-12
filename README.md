@@ -20,9 +20,10 @@ El flujo **no se ejecuta todo junto**: cada etapa tiene una puerta de aprobació
 
 1. **Sourcing** → Places / SerpAPI / Outscraper / Bright Data / Apollo / Clay / IG-FB / Directorios AR  
 2. **Enrichment** → email (Hunter/Snov/heurística) + LinkedIn vía Clay  
-3. **Scoring** → uno a uno o lote confirmado  
-4. **Despacho** → Instantly / webhook supervisado  
-5. **CRM** → pipeline + export  
+3. **Web / Dolores** → scrape del sitio + dolores/ángulo/icebreaker con Claude (o heurística)  
+4. **Scoring** → uno a uno o lote confirmado (usa dolores del scrape)  
+5. **Despacho** → Instantly / webhook supervisado  
+6. **CRM** → pipeline + export  
 
 ## Inicio rápido
 

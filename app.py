@@ -15,9 +15,11 @@ import re
 import time
 import uuid
 from datetime import datetime, timezone
+from html.parser import HTMLParser
 from io import BytesIO
 from pathlib import Path
 from typing import Any
+from urllib.parse import urljoin, urlparse
 
 import httpx
 import pandas as pd
@@ -49,6 +51,11 @@ CRM_COLUMNS = [
     "lead_score",
     "score_razon",
     "icebreaker",
+    "website_summary",
+    "dolores",
+    "angulo_email",
+    "scrape_status",
+    "scrape_fuente",
     "pipeline_status",
     "calendario_url",
     "notas",
@@ -227,14 +234,19 @@ def reset_pipeline_state_for_client() -> None:
     st.session_state.scored_leads = pd.DataFrame()
     st.session_state.high_leads = pd.DataFrame()
     st.session_state.enriched_leads = pd.DataFrame()
+    st.session_state.researched_leads = pd.DataFrame()
     st.session_state.last_search_meta = {}
     st.session_state.pipeline_step = 1
     st.session_state.step1_approved = False
     st.session_state.step2_approved = False
     st.session_state.step_enrich_approved = False
+    st.session_state.step_scrape_approved = False
     st.session_state.scoring_queue_ids = []
     st.session_state.scoring_queue_idx = 0
     st.session_state.scoring_current_result = None
+    st.session_state.scrape_queue_ids = []
+    st.session_state.scrape_queue_idx = 0
+    st.session_state.scrape_current_result = None
     st.session_state.dispatch_queue_ids = []
     st.session_state.dispatch_queue_idx = 0
     st.session_state.dispatch_approved_ids = []
@@ -248,20 +260,26 @@ def init_session_state() -> None:
         "sourced_leads": pd.DataFrame(),
         "selected_lead_ids": [],
         "enriched_leads": pd.DataFrame(),
+        "researched_leads": pd.DataFrame(),
         "scored_leads": pd.DataFrame(),
         "high_leads": pd.DataFrame(),
         "dispatch_log": pd.DataFrame(columns=DISPATCH_COLUMNS),
         "last_search_meta": {},
         "api_errors": [],
-        # Pipeline: 1 sourcing → 2 enrich → 3 scoring → 4 dispatch → 5 crm
+        # Pipeline: 1 sourcing → 2 enrich → 3 web/dolores → 4 scoring → 5 dispatch → 6 crm
         "pipeline_step": 1,
         "step1_approved": False,
         "step_enrich_approved": False,
+        "step_scrape_approved": False,
         "step2_approved": False,
         "scoring_mode": "Uno a uno (supervisado)",
         "scoring_queue_ids": [],
         "scoring_queue_idx": 0,
         "scoring_current_result": None,
+        "scrape_mode": "Uno a uno (supervisado)",
+        "scrape_queue_ids": [],
+        "scrape_queue_idx": 0,
+        "scrape_current_result": None,
         "dispatch_mode": "Uno a uno (supervisado)",
         "dispatch_queue_ids": [],
         "dispatch_queue_idx": 0,
@@ -1542,6 +1560,371 @@ def upsert_enriched_lead(lead: dict[str, Any]) -> None:
         st.session_state.sourced_leads = sourced
 
 
+# ---------------------------------------------------------------------------
+# Research web: scrape del sitio + dolores / ángulo con Claude
+# ---------------------------------------------------------------------------
+class _HTMLTextExtractor(HTMLParser):
+    """Extrae texto visible de HTML (stdlib, sin BeautifulSoup)."""
+
+    _SKIP = {"script", "style", "noscript", "svg", "iframe", "head"}
+
+    def __init__(self) -> None:
+        super().__init__()
+        self._skip_depth = 0
+        self.parts: list[str] = []
+        self.title = ""
+        self._in_title = False
+
+    def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
+        t = tag.lower()
+        if t in self._SKIP:
+            self._skip_depth += 1
+        if t == "title":
+            self._in_title = True
+
+    def handle_endtag(self, tag: str) -> None:
+        t = tag.lower()
+        if t in self._SKIP and self._skip_depth:
+            self._skip_depth -= 1
+        if t == "title":
+            self._in_title = False
+
+    def handle_data(self, data: str) -> None:
+        text = " ".join(data.split())
+        if not text:
+            return
+        if self._in_title and not self.title:
+            self.title = text
+        if self._skip_depth:
+            return
+        self.parts.append(text)
+
+
+def _normalize_website_url(raw: str) -> str:
+    url = _safe_str(raw)
+    if not url:
+        return ""
+    if url.startswith("http://") or url.startswith("https://"):
+        return url
+    return f"https://{url}"
+
+
+def _candidate_paths(base_url: str) -> list[str]:
+    """Homepage + páginas típicas AR/ES para señales comerciales."""
+    base = _normalize_website_url(base_url).rstrip("/")
+    if not base:
+        return []
+    paths = ["", "/servicios", "/nosotros", "/contacto", "/about", "/services", "/empresa"]
+    seen: set[str] = set()
+    out: list[str] = []
+    for p in paths:
+        u = urljoin(base + "/", p.lstrip("/")) if p else base
+        if u not in seen:
+            seen.add(u)
+            out.append(u)
+    return out
+
+
+def fetch_website_text(website: str, max_chars: int = 12000, timeout: float = 12.0) -> dict[str, Any]:
+    """
+    Descarga 1–N páginas del sitio y concatena texto visible.
+    Retorna {ok, text, title, pages_ok, error, fuente_urls}.
+    """
+    urls = _candidate_paths(website)
+    if not urls:
+        return {
+            "ok": False,
+            "text": "",
+            "title": "",
+            "pages_ok": 0,
+            "error": "sin_website",
+            "fuente_urls": "",
+        }
+
+    headers = {
+        "User-Agent": (
+            "Mozilla/5.0 (compatible; KatemSDR/1.0; +https://katem.com.ar; research-bot)"
+        ),
+        "Accept": "text/html,application/xhtml+xml;q=0.9,*/*;q=0.8",
+        "Accept-Language": "es-AR,es;q=0.9,en;q=0.5",
+    }
+    chunks: list[str] = []
+    titles: list[str] = []
+    ok_urls: list[str] = []
+    last_err = ""
+
+    with httpx.Client(follow_redirects=True, timeout=timeout, headers=headers) as client:
+        for url in urls:
+            if sum(len(c) for c in chunks) >= max_chars:
+                break
+            try:
+                resp = client.get(url)
+                if resp.status_code >= 400:
+                    last_err = f"HTTP {resp.status_code} @ {url}"
+                    continue
+                ctype = (resp.headers.get("content-type") or "").lower()
+                if "html" not in ctype and "text" not in ctype and ctype:
+                    continue
+                parser = _HTMLTextExtractor()
+                try:
+                    parser.feed(resp.text[:250_000])
+                except Exception as exc:  # noqa: BLE001
+                    last_err = f"parse_error:{exc}"
+                    continue
+                page_text = " ".join(parser.parts)
+                if len(page_text) < 40:
+                    continue
+                ok_urls.append(url)
+                if parser.title:
+                    titles.append(parser.title)
+                host = urlparse(url).path or "/"
+                chunks.append(f"[Página {host}]\n{page_text}")
+            except Exception as exc:  # noqa: BLE001
+                last_err = str(exc)
+                continue
+
+    text = "\n\n".join(chunks).strip()
+    if len(text) > max_chars:
+        text = text[:max_chars] + "…"
+    if not text:
+        return {
+            "ok": False,
+            "text": "",
+            "title": titles[0] if titles else "",
+            "pages_ok": 0,
+            "error": last_err or "sin_contenido",
+            "fuente_urls": "",
+        }
+    return {
+        "ok": True,
+        "text": text,
+        "title": titles[0] if titles else "",
+        "pages_ok": len(ok_urls),
+        "error": "",
+        "fuente_urls": " | ".join(ok_urls[:4]),
+    }
+
+
+def _client_offer_context() -> str:
+    client = get_client(st.session_state.get("active_client_id", "katem-demo"))
+    vertical = _safe_str(client.get("vertical"))
+    tpl = VERTICAL_TEMPLATES.get(vertical, {})
+    return (
+        f"Cliente/workspace: {_safe_str(client.get('name')) or client.get('id')}\n"
+        f"Marca: {_safe_str(client.get('brand'))}\n"
+        f"Vertical: {tpl.get('label', vertical)}\n"
+        f"Oferta / scoring hint: {_safe_str(tpl.get('scoring_hint'))}\n"
+        f"Notas: {_safe_str(client.get('notes'))}"
+    )
+
+
+PAIN_EXTRACTION_SYSTEM = """Eres un estratega de outbound B2B en Argentina.
+Analizás el texto de un sitio web de un lead y detectás dolores/oportunidades
+reales para un email frío personalizado.
+
+Reglas:
+- Usá SOLO evidencia del texto del sitio. No inventes datos, métricas ni stack.
+- Si el texto es pobre, decilo y proponé ángulos prudentes (presencia digital, captura de leads, reputación).
+- Escribí en español rioplatense, tono consultivo, sin humo.
+- El icebreaker debe sonar humano (1-2 oraciones), mencionando algo concreto del sitio.
+
+Respondé ÚNICAMENTE JSON válido (sin markdown) con esta forma:
+{
+  "website_summary": "resumen del negocio en 1-2 oraciones",
+  "dolores": ["dolor 1", "dolor 2", "dolor 3"],
+  "angulo_email": "ángulo comercial concreto para el outreach",
+  "icebreaker": "apertura de email personalizada 1-2 oraciones"
+}
+"""
+
+
+def _heuristic_pain_from_text(lead: dict[str, Any], site: dict[str, Any]) -> dict[str, str]:
+    """Fallback local si no hay Anthropic o falla la API."""
+    nombre = _safe_str(lead.get("nombre")) or "tu equipo"
+    rubro = _safe_str(lead.get("rubro")) or "tu rubro"
+    ubicacion = _safe_str(lead.get("ubicacion")) or "la zona"
+    text = (site.get("text") or "").lower()
+    title = _safe_str(site.get("title"))
+
+    signals: list[str] = []
+    if "whatsapp" in text or "wa.me" in text:
+        signals.append("Dependencia alta de WhatsApp (poca captura/automatización de leads).")
+    if "instagram" in text and "formulario" not in text:
+        signals.append("Presencia social visible, pero sin funnel claro en el sitio.")
+    if any(k in text for k in ("turno", "reserva", "cita", "agenda")):
+        signals.append("Agenda/turnos manuales: oportunidad de automatizar captación.")
+    if any(k in text for k in ("delivery", "envíos", "pedidos ya", "rappi")):
+        signals.append("Canal delivery activo: reputación y presencia local importan.")
+    if not signals:
+        signals = [
+            f"Sitio de {rubro} con poca claridad de propuesta o CTA.",
+            "Oportunidad de mejorar presencia local / captación de consultas.",
+            "Email frío puede anclarse en diferenciación frente a competidores de la zona.",
+        ]
+
+    summary = (
+        f"{title or nombre}: negocio de {rubro} en {ubicacion}. "
+        f"Se extrajo texto de {site.get('pages_ok', 0)} página(s)."
+        if site.get("ok")
+        else f"{nombre}: sin contenido web usable ({site.get('error') or 'sin_website'})."
+    )
+    angulo = (
+        f"Ofrecer ayuda concreta para captar más consultas de {rubro} en {ubicacion} "
+        f"mejorando presencia digital y seguimiento."
+    )
+    if site.get("ok") and title:
+        ice = (
+            f"Vi el sitio de {nombre} ({title}) y me llamó la atención cómo presentan "
+            f"{rubro} en {ubicacion}. ¿Les suma charlar una idea corta para traer más consultas?"
+        )
+    else:
+        ice = (
+            f"Hola equipo de {nombre}: estoy mapeando {rubro} en {ubicacion} y creo que "
+            f"pueden destacar más frente a clientes locales. ¿Les sirve una idea breve?"
+        )
+    return {
+        "website_summary": summary,
+        "dolores": " | ".join(signals[:3]),
+        "angulo_email": angulo,
+        "icebreaker": ice,
+        "scrape_status": "ok_heuristica" if site.get("ok") else f"fallback:{site.get('error') or 'sin_web'}",
+        "scrape_fuente": _safe_str(site.get("fuente_urls")) or "heuristica",
+    }
+
+
+def extract_pains_with_claude(
+    lead: dict[str, Any],
+    site: dict[str, Any],
+    api_key: str,
+    model: str = "claude-3-5-haiku-20241022",
+) -> dict[str, str]:
+    """Usa Claude para resumir el sitio y proponer dolores + icebreaker."""
+    if not api_key:
+        return _heuristic_pain_from_text(lead, site)
+    if not site.get("ok"):
+        return _heuristic_pain_from_text(lead, site)
+
+    user_content = (
+        f"{_client_offer_context()}\n\n"
+        f"Lead:\n{json.dumps({k: lead.get(k) for k in ('nombre','rubro','ubicacion','website','email','telefono')}, ensure_ascii=False, indent=2)}\n\n"
+        f"Título detectado: {site.get('title')}\n"
+        f"URLs leídas: {site.get('fuente_urls')}\n\n"
+        f"Texto del sitio:\n{site.get('text')}"
+    )
+    url = "https://api.anthropic.com/v1/messages"
+    headers = {
+        "x-api-key": api_key,
+        "anthropic-version": "2023-06-01",
+        "Content-Type": "application/json",
+    }
+    body = {
+        "model": model,
+        "max_tokens": 900,
+        "temperature": 0.3,
+        "system": PAIN_EXTRACTION_SYSTEM,
+        "messages": [{"role": "user", "content": user_content}],
+    }
+    try:
+        resp = requests.post(url, headers=headers, json=body, timeout=90)
+        resp.raise_for_status()
+        data = resp.json()
+        parts = data.get("content", [])
+        text = "".join(p.get("text", "") for p in parts if p.get("type") == "text")
+        parsed = _extract_json_object(text)
+        if not parsed:
+            out = _heuristic_pain_from_text(lead, site)
+            out["scrape_status"] = "claude_parse_fallback"
+            return out
+        dolores = parsed.get("dolores") or []
+        if isinstance(dolores, list):
+            dolores_txt = " | ".join(_safe_str(x) for x in dolores if _safe_str(x))
+        else:
+            dolores_txt = _safe_str(dolores)
+        return {
+            "website_summary": _safe_str(parsed.get("website_summary")),
+            "dolores": dolores_txt,
+            "angulo_email": _safe_str(parsed.get("angulo_email")),
+            "icebreaker": _safe_str(parsed.get("icebreaker")),
+            "scrape_status": "ok_claude",
+            "scrape_fuente": _safe_str(site.get("fuente_urls")),
+        }
+    except Exception as exc:  # noqa: BLE001
+        out = _heuristic_pain_from_text(lead, site)
+        out["scrape_status"] = f"claude_error_fallback:{exc}"
+        return out
+
+
+def research_one_lead(
+    lead: dict[str, Any],
+    anthropic_key: str,
+    model: str = "claude-3-5-haiku-20241022",
+    use_claude: bool = True,
+) -> dict[str, Any]:
+    """Scrape del website + extracción de dolores (Claude o heurística)."""
+    out = dict(lead)
+    website = _safe_str(lead.get("website"))
+    site = fetch_website_text(website) if website else {
+        "ok": False,
+        "text": "",
+        "title": "",
+        "pages_ok": 0,
+        "error": "sin_website",
+        "fuente_urls": "",
+    }
+    if use_claude and anthropic_key and site.get("ok"):
+        pains = extract_pains_with_claude(out, site, anthropic_key, model)
+    else:
+        pains = _heuristic_pain_from_text(out, site)
+        if not anthropic_key and site.get("ok"):
+            pains["scrape_status"] = "ok_heuristica_sin_claude"
+    out.update(pains)
+    return out
+
+
+def research_leads_batch(
+    leads_df: pd.DataFrame,
+    anthropic_key: str,
+    model: str,
+    use_claude: bool,
+) -> pd.DataFrame:
+    rows: list[dict[str, Any]] = []
+    total = max(len(leads_df), 1)
+    progress = st.progress(0.0, text="Scrapeando sitios y extrayendo dolores…")
+    for idx, (_, row) in enumerate(leads_df.iterrows()):
+        rows.append(
+            research_one_lead(row.to_dict(), anthropic_key, model, use_claude=use_claude)
+        )
+        progress.progress(
+            (idx + 1) / total,
+            text=f"Research {idx + 1}/{len(leads_df)}",
+        )
+    progress.empty()
+    return pd.DataFrame(rows)
+
+
+def upsert_researched_lead(lead: dict[str, Any]) -> None:
+    """Actualiza researched_leads (+ sync enriched/sourced)."""
+    lid = _safe_str(lead.get("id"))
+    researched = st.session_state.get("researched_leads", pd.DataFrame())
+    row = pd.DataFrame([lead])
+    if not isinstance(researched, pd.DataFrame) or researched.empty:
+        st.session_state.researched_leads = row
+    else:
+        if lid and (researched["id"].astype(str) == lid).any():
+            researched = researched[researched["id"].astype(str) != lid]
+        st.session_state.researched_leads = pd.concat([researched, row], ignore_index=True)
+
+    # Sync enriched + sourced so downstream steps see dolores/icebreaker
+    for key in ("enriched_leads", "sourced_leads"):
+        df = st.session_state.get(key, pd.DataFrame())
+        if isinstance(df, pd.DataFrame) and not df.empty and lid:
+            for col, val in lead.items():
+                if col == "seleccionado":
+                    continue
+                if col not in df.columns:
+                    df[col] = ""
+                df.loc[df["id"].astype(str) == lid, col] = val
+            st.session_state[key] = df
 
 
 # ---------------------------------------------------------------------------
@@ -1553,6 +1936,9 @@ SCORING_SYSTEM_PROMPT = """Eres un analista senior de calificación de leads B2B
 Evalúa si el negocio es un cliente ideal para:
 1) Presencia en un directorio B2B/local de alta calidad (Guía Pilar), y/o
 2) Servicios digitales / marketing / automatización del estudio Katem.
+
+Si el lead trae website_summary / dolores / angulo_email (research del sitio),
+PRIORIZÁ esa evidencia para score_razon e icebreaker (no inventes).
 
 Responde ÚNICAMENTE con JSON válido (sin markdown) con esta forma exacta:
 {
@@ -1624,6 +2010,16 @@ def _heuristic_score(lead: dict[str, Any]) -> dict[str, str]:
             f"Hola equipo de {nombre}: estoy armando el mapa de {rubro} en {ubicacion} "
             f"para Guía Pilar y Katem. Creo que pueden destacar mucho frente a clientes "
             f"que buscan proveedores confiables — ¿charlamos 10 minutos?"
+        )
+
+    prior_ice = _safe_str(lead.get("icebreaker"))
+    if prior_ice:
+        icebreaker = prior_ice
+    elif _safe_str(lead.get("dolores")):
+        first_pain = _safe_str(lead.get("dolores")).split("|")[0].strip()
+        icebreaker = (
+            f"Vi el sitio de {nombre} y me quedó resonando esto: {first_pain}. "
+            f"¿Les suma charlar una idea corta para {ubicacion}?"
         )
 
     return {
@@ -1801,6 +2197,9 @@ def build_outbound_payload(lead: dict[str, Any], campaign_id: str) -> dict[str, 
             "icebreaker": _safe_str(lead.get("icebreaker")),
             "lead_score": _safe_str(lead.get("lead_score")),
             "score_razon": _safe_str(lead.get("score_razon")),
+            "website_summary": _safe_str(lead.get("website_summary")),
+            "dolores": _safe_str(lead.get("dolores")),
+            "angulo_email": _safe_str(lead.get("angulo_email")),
             "direccion": _safe_str(lead.get("direccion")),
             "rubro": _safe_str(lead.get("rubro")),
             "ubicacion": _safe_str(lead.get("ubicacion")),
@@ -2231,12 +2630,13 @@ def render_pipeline_stepper() -> None:
     steps = [
         (1, "🔍 Sourcing"),
         (2, "✨ Enrich"),
-        (3, "🧠 Scoring"),
-        (4, "🚀 Despacho"),
-        (5, "📊 CRM"),
+        (3, "🌐 Web/Dolores"),
+        (4, "🧠 Scoring"),
+        (5, "🚀 Despacho"),
+        (6, "📊 CRM"),
     ]
     current = int(st.session_state.get("pipeline_step", 1))
-    cols = st.columns(5)
+    cols = st.columns(6)
     for (num, label), col in zip(steps, cols):
         if num < current:
             col.success(f"✓ {label}")
@@ -2259,9 +2659,9 @@ def render_pipeline_stepper() -> None:
     with c3:
         jump = st.selectbox(
             "Ir al paso",
-            options=[1, 2, 3, 4, 5],
+            options=[1, 2, 3, 4, 5, 6],
             format_func=lambda n: steps[n - 1][1],
-            index=current - 1,
+            index=min(max(current, 1), 6) - 1,
             label_visibility="collapsed",
         )
         if jump != current:
@@ -2630,36 +3030,270 @@ def tab_enrichment(cfg: dict[str, str]) -> None:
             hide_index=True,
         )
 
-        st.markdown("#### Puerta de aprobación — Paso 2 → Paso 3 (Scoring)")
+        st.markdown("#### Puerta de aprobación — Paso 2 → Paso 3 (Web / Dolores)")
         confirm2 = st.checkbox(
-            "Revisé emails/LinkedIn y quiero pasar estos leads a scoring",
+            "Revisé emails/LinkedIn y quiero scrapear sitios para personalizar emails",
             key="confirm_enrich_gate",
         )
         if st.button(
-            "Aprobar enrichment y pasar a Scoring →",
+            "Aprobar enrichment y pasar a Web/Dolores →",
             type="primary",
             use_container_width=True,
             disabled=not confirm2,
         ):
             st.session_state.step_enrich_approved = True
+            st.session_state.step_scrape_approved = False
             st.session_state.pipeline_step = 3
-            # scoring should use enriched leads
-            st.session_state.scoring_queue_ids = enriched["id"].astype(str).tolist()
-            st.session_state.scoring_queue_idx = 0
-            st.success("Enrichment aprobado. Continuá en Scoring.")
+            st.session_state.scrape_queue_ids = enriched["id"].astype(str).tolist()
+            st.session_state.scrape_queue_idx = 0
+            st.session_state.scrape_current_result = None
+            # seed researched with enriched rows
+            st.session_state.researched_leads = enriched.copy()
+            st.success("Enrichment aprobado. Continuá en Web / Dolores.")
             st.rerun()
         if st.session_state.step_enrich_approved:
-            st.success("✓ Enrichment aprobado — podés calificar en Scoring.")
+            st.success("✓ Enrichment aprobado — podés investigir sitios en Web/Dolores.")
     else:
         st.info("Todavía no hay leads enriquecidos.")
 
 
+def tab_research(cfg: dict[str, str]) -> None:
+    st.subheader("🌐 Paso 3 — Scrape Web + Dolores (Claude)")
+    st.write(
+        "Scrapeá el sitio de cada lead, extráé dolores/ángulo con **Claude** "
+        "(o heurística local) y aprobá antes de scoring. "
+        "Claude no scrapea: lee el texto que bajamos del website."
+    )
+
+    if not st.session_state.step1_approved:
+        st.warning("Primero aprobá la selección en **Paso 1 (Sourcing)**.")
+        if st.button("Ir a Sourcing", key="research_go_sourcing"):
+            st.session_state.pipeline_step = 1
+            st.rerun()
+        return
+    if not st.session_state.step_enrich_approved:
+        st.warning("Primero completá y aprobá **Paso 2 (Enrichment)**.")
+        if st.button("Ir a Enrichment", key="research_go_enrich"):
+            st.session_state.pipeline_step = 2
+            st.rerun()
+        return
+
+    base = st.session_state.get("researched_leads", pd.DataFrame())
+    if not isinstance(base, pd.DataFrame) or base.empty:
+        enriched = st.session_state.get("enriched_leads", pd.DataFrame())
+        if isinstance(enriched, pd.DataFrame) and not enriched.empty:
+            base = enriched.copy()
+            st.session_state.researched_leads = base
+        else:
+            base = get_selected_sourced_leads().drop(columns=["seleccionado"], errors="ignore")
+            st.session_state.researched_leads = base.copy()
+        if not st.session_state.scrape_queue_ids and not base.empty:
+            st.session_state.scrape_queue_ids = base["id"].astype(str).tolist()
+            st.session_state.scrape_queue_idx = 0
+
+    if not isinstance(base, pd.DataFrame) or base.empty:
+        st.warning("No hay leads para investigar.")
+        return
+
+    c1, c2, c3 = st.columns(3)
+    with c1:
+        use_claude = st.checkbox(
+            "Usar Claude para dolores",
+            value=bool(cfg.get("anthropic_key")),
+            help="Sin ANTHROPIC_API_KEY → heurística local sobre el texto scrapeado.",
+        )
+    with c2:
+        claude_model = st.text_input(
+            "Modelo Claude (research)",
+            value="claude-3-5-haiku-20241022",
+            help="Haiku es barato para research; Sonnet si querés más calidad.",
+        )
+    with c3:
+        mode = st.radio(
+            "Modo",
+            ["Uno a uno (supervisado)", "Lote completo (con confirmación)"],
+            key="scrape_mode_radio",
+        )
+    st.session_state.scrape_mode = mode
+    st.metric("Leads en cola", len(base))
+    if use_claude and not cfg.get("anthropic_key"):
+        st.info("Sin `ANTHROPIC_API_KEY`: se scrapeá el sitio y se usan dolores heurísticos.")
+
+    # ---- Uno a uno ----
+    if mode.startswith("Uno a uno"):
+        queue = st.session_state.scrape_queue_ids or base["id"].astype(str).tolist()
+        if not st.session_state.scrape_queue_ids:
+            st.session_state.scrape_queue_ids = queue
+            st.session_state.scrape_queue_idx = 0
+        idx = int(st.session_state.scrape_queue_idx)
+        total_q = len(st.session_state.scrape_queue_ids)
+        if idx >= total_q:
+            st.success(f"Cola de research finalizada ({total_q}/{total_q}).")
+        else:
+            lead_id = str(st.session_state.scrape_queue_ids[idx])
+            lead_row = base[base["id"].astype(str) == lead_id]
+            if lead_row.empty:
+                st.session_state.scrape_queue_idx = idx + 1
+                st.rerun()
+            lead = lead_row.iloc[0].to_dict()
+            st.markdown(f"##### Lead {idx + 1} de {total_q}: **{_safe_str(lead.get('nombre'))}**")
+            st.write(
+                {
+                    "website": lead.get("website"),
+                    "email": lead.get("email"),
+                    "rubro": lead.get("rubro"),
+                    "ubicacion": lead.get("ubicacion"),
+                    "scrape_status": lead.get("scrape_status"),
+                }
+            )
+            b1, b2, b3 = st.columns(3)
+            with b1:
+                if st.button(
+                    "Scrape + dolores",
+                    type="primary",
+                    use_container_width=True,
+                    key="research_one_btn",
+                ):
+                    result = research_one_lead(
+                        lead,
+                        cfg.get("anthropic_key", ""),
+                        claude_model.strip() or "claude-3-5-haiku-20241022",
+                        use_claude=use_claude,
+                    )
+                    st.session_state.scrape_current_result = result
+                    upsert_researched_lead(result)
+                    st.rerun()
+            with b2:
+                if st.button("Siguiente →", use_container_width=True, key="research_next_btn"):
+                    st.session_state.scrape_current_result = None
+                    st.session_state.scrape_queue_idx = idx + 1
+                    st.rerun()
+            with b3:
+                if st.button("Omitir →", use_container_width=True, key="research_skip_btn"):
+                    st.session_state.scrape_current_result = None
+                    st.session_state.scrape_queue_idx = idx + 1
+                    st.rerun()
+
+            current = st.session_state.scrape_current_result
+            if not current or _safe_str(current.get("id")) != lead_id:
+                # show saved research if any
+                current = lead if _safe_str(lead.get("scrape_status")) else None
+            if current and _safe_str(current.get("id")) == lead_id and _safe_str(current.get("scrape_status")):
+                st.markdown("###### Resultado — editá antes de seguir")
+                st.caption(f"Status: `{_safe_str(current.get('scrape_status'))}` · Fuente: `{_safe_str(current.get('scrape_fuente'))}`")
+                new_summary = st.text_area(
+                    "Resumen del sitio",
+                    value=_safe_str(current.get("website_summary")),
+                    key=f"edit_sum_{lead_id}",
+                )
+                new_dolores = st.text_area(
+                    "Dolores (separados por |)",
+                    value=_safe_str(current.get("dolores")),
+                    key=f"edit_dol_{lead_id}",
+                )
+                new_angulo = st.text_area(
+                    "Ángulo email",
+                    value=_safe_str(current.get("angulo_email")),
+                    key=f"edit_ang_{lead_id}",
+                )
+                new_ice = st.text_area(
+                    "Icebreaker",
+                    value=_safe_str(current.get("icebreaker")),
+                    key=f"edit_ice_res_{lead_id}",
+                )
+                if st.button("✓ Guardar edición y siguiente", type="primary", use_container_width=True):
+                    current = dict(current)
+                    current["website_summary"] = new_summary
+                    current["dolores"] = new_dolores
+                    current["angulo_email"] = new_angulo
+                    current["icebreaker"] = new_ice
+                    upsert_researched_lead(current)
+                    st.session_state.scrape_current_result = None
+                    st.session_state.scrape_queue_idx = idx + 1
+                    st.rerun()
+    else:
+        confirm_batch = st.checkbox(
+            f"Confirmo scrapear y analizar {len(base)} sitios (Claude={use_claude})",
+            key="confirm_research_batch",
+        )
+        if st.button(
+            "Research lote completo",
+            type="primary",
+            use_container_width=True,
+            disabled=not confirm_batch,
+            key="research_batch_btn",
+        ):
+            out = research_leads_batch(
+                base,
+                cfg.get("anthropic_key", ""),
+                claude_model.strip() or "claude-3-5-haiku-20241022",
+                use_claude,
+            )
+            st.session_state.researched_leads = out
+            for _, row in out.iterrows():
+                upsert_researched_lead(row.to_dict())
+            st.session_state.scrape_queue_idx = len(base)
+            st.success(f"Lote researched: {len(out)} leads.")
+            st.rerun()
+
+    researched = st.session_state.researched_leads
+    if isinstance(researched, pd.DataFrame) and not researched.empty:
+        st.markdown("#### Resultado del research")
+        done = 0
+        if "scrape_status" in researched.columns:
+            done = int(researched["scrape_status"].astype(str).str.len().gt(0).sum())
+        m1, m2, m3 = st.columns(3)
+        m1.metric("Con research", done)
+        m2.metric("Con website", int(researched.get("website", pd.Series(dtype=str)).astype(str).str.len().gt(0).sum()) if "website" in researched.columns else 0)
+        m3.metric("Total", len(researched))
+        st.dataframe(
+            researched[
+                [
+                    c
+                    for c in [
+                        "nombre",
+                        "website",
+                        "website_summary",
+                        "dolores",
+                        "angulo_email",
+                        "icebreaker",
+                        "scrape_status",
+                    ]
+                    if c in researched.columns
+                ]
+            ],
+            use_container_width=True,
+            hide_index=True,
+        )
+
+        st.markdown("#### Puerta de aprobación — Paso 3 → Paso 4 (Scoring)")
+        confirm_r = st.checkbox(
+            "Revisé resumen/dolores/icebreakers y quiero pasar a scoring",
+            key="confirm_research_gate",
+        )
+        if st.button(
+            "Aprobar research y pasar a Scoring →",
+            type="primary",
+            use_container_width=True,
+            disabled=not confirm_r,
+        ):
+            st.session_state.step_scrape_approved = True
+            st.session_state.pipeline_step = 4
+            st.session_state.scoring_queue_ids = researched["id"].astype(str).tolist()
+            st.session_state.scoring_queue_idx = 0
+            st.success("Research aprobado. Continuá en Scoring.")
+            st.rerun()
+        if st.session_state.step_scrape_approved:
+            st.success("✓ Research aprobado — podés calificar en Scoring.")
+    else:
+        st.info("Todavía no hay research guardado.")
+
 
 def tab_scoring(cfg: dict[str, str]) -> None:
-    st.subheader("🧠 Paso 3 — Scoring e Inteligencia (supervisado)")
+    st.subheader("🧠 Paso 4 — Scoring e Inteligencia (supervisado)")
     st.write(
         "Calificá leads de a uno (recomendado) o en lote con confirmación. "
-        "Revisá score, razón e icebreaker antes de aprobar el paso de despacho."
+        "Revisá score, razón e icebreaker (prioriza dolores del scrape) antes de despacho."
     )
 
     if not st.session_state.step1_approved:
@@ -2674,9 +3308,18 @@ def tab_scoring(cfg: dict[str, str]) -> None:
             st.session_state.pipeline_step = 2
             st.rerun()
         return
+    if not st.session_state.step_scrape_approved:
+        st.warning("Primero completá y aprobá **Paso 3 (Web / Dolores)**.")
+        if st.button("Ir a Web/Dolores", key="scoring_go_research"):
+            st.session_state.pipeline_step = 3
+            st.rerun()
+        return
 
+    researched = st.session_state.get("researched_leads", pd.DataFrame())
     enriched = st.session_state.get("enriched_leads", pd.DataFrame())
-    if isinstance(enriched, pd.DataFrame) and not enriched.empty:
+    if isinstance(researched, pd.DataFrame) and not researched.empty:
+        to_score = researched.copy()
+    elif isinstance(enriched, pd.DataFrame) and not enriched.empty:
         to_score = enriched.copy()
     else:
         to_score = get_selected_sourced_leads()
@@ -2704,6 +3347,9 @@ def tab_scoring(cfg: dict[str, str]) -> None:
     )
     st.session_state.scoring_mode = mode
     st.metric("Leads en cola", len(to_score))
+
+    # Keep the rest of scoring body unchanged from here — replaced only the header/gates/to_score
+    # -------- marker for next replace: scoring body continues below --------
 
     # -------- Modo uno a uno --------
     if mode.startswith("Uno a uno"):
@@ -2853,7 +3499,7 @@ def tab_scoring(cfg: dict[str, str]) -> None:
             st.rerun()
 
         high = st.session_state.high_leads
-        st.markdown("#### Puerta de aprobación — Paso 3 → Paso 4 (Despacho)")
+        st.markdown("#### Puerta de aprobación — Paso 4 → Paso 5 (Despacho)")
         n_high = len(high) if isinstance(high, pd.DataFrame) else 0
         confirm2 = st.checkbox(
             f"Revisé los scores e icebreakers. Apruebo {n_high} lead(s) High para despacho",
@@ -2871,25 +3517,25 @@ def tab_scoring(cfg: dict[str, str]) -> None:
             st.session_state.dispatch_approved_ids = high["id"].astype(str).tolist()
             st.session_state.dispatch_queue_ids = high["id"].astype(str).tolist()
             st.session_state.dispatch_queue_idx = 0
-            st.success("Paso 3 aprobado. Continuá en Despacho Outbound.")
+            st.success("Paso 4 (Scoring) aprobado. Continuá en Despacho Outbound.")
             st.rerun()
         if st.session_state.step2_approved:
-            st.success("✓ Paso 3 aprobado — podés despachar en Outbound.")
+            st.success("✓ Paso 4 aprobado — podés despachar en Outbound.")
     else:
         st.info("Todavía no hay leads calificados. Usá el modo uno a uno o el lote.")
 
 
 def tab_dispatch(cfg: dict[str, str]) -> None:
-    st.subheader("🚀 Paso 4 — Despacho Outbound (supervisado)")
+    st.subheader("🚀 Paso 5 — Despacho Outbound (supervisado)")
     st.write(
         "Enviá leads High de a uno o el lote aprobado. Cada envío requiere confirmación "
         "explícita para que puedas supervisar el proceso."
     )
 
     if not st.session_state.step2_approved:
-        st.warning("Primero aprobá los leads High en **Paso 3 (Scoring)**.")
+        st.warning("Primero aprobá los leads High en **Paso 4 (Scoring)**.")
         if st.button("Ir a Scoring", key="dispatch_go_scoring"):
-            st.session_state.pipeline_step = 3
+            st.session_state.pipeline_step = 4
             st.rerun()
         return
 
@@ -3057,14 +3703,14 @@ def tab_dispatch(cfg: dict[str, str]) -> None:
                 )
                 ok_n = sum(1 for r in logs if r["exito"] == "sí")
                 fail_n = len(logs) - ok_n
-                st.session_state.pipeline_step = 5
+                st.session_state.pipeline_step = 6
                 if ok_n:
                     st.success(f"Despacho finalizado: {ok_n} OK · {fail_n} fallidos. Revisá el CRM.")
                 else:
                     st.error(f"Ningún envío exitoso ({fail_n} fallidos).")
 
     if st.button("Marcar paso completado e ir al CRM →", use_container_width=True):
-        st.session_state.pipeline_step = 5
+        st.session_state.pipeline_step = 6
         st.rerun()
 
     st.markdown("#### Historial / log de envíos")
@@ -3082,7 +3728,7 @@ def tab_dispatch(cfg: dict[str, str]) -> None:
 
 
 def tab_crm(cfg: dict[str, str]) -> None:
-    st.subheader("📊 Paso 5 — CRM Local y Agendamiento")
+    st.subheader("📊 Paso 6 — CRM Local y Agendamiento")
     st.write(
         f"Pipeline persistente en `{get_crm_path().resolve()}`. "
         "Actualizá estados (Contactado → Respuesta → Agendado) y exportá a CSV/Excel."
@@ -3270,7 +3916,7 @@ def main() -> None:
     st.caption(
         f"Vertical productizada de Katem · Workspace: **{client.get('name')}** "
         f"({client.get('vertical')}) · "
-        "Sourcing → Enrichment → Scoring → Outbound → CRM"
+        "Sourcing → Enrichment → Web/Dolores → Scoring → Outbound → CRM"
     )
 
     cfg = render_sidebar()
@@ -3280,19 +3926,21 @@ def main() -> None:
     step_hints = {
         1: "Sourcing: buscá leads y aprobá la selección.",
         2: "Enrichment: completá email + LinkedIn (Clay) y aprobá.",
-        3: "Scoring: calificá de a uno o en lote confirmado.",
-        4: "Despacho: enviá High con supervisión.",
-        5: "CRM: actualizá pipeline y exportá.",
+        3: "Web/Dolores: scrapeá sitios y extraé dolores con Claude (o heurística).",
+        4: "Scoring: calificá de a uno o en lote confirmado.",
+        5: "Despacho: enviá High con supervisión.",
+        6: "CRM: actualizá pipeline y exportá.",
     }
     st.info(step_hints.get(step, ""))
 
-    tab1, tab2, tab3, tab4, tab5 = st.tabs(
+    tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs(
         [
             "🔍 1. Sourcing",
             "✨ 2. Enrichment",
-            "🧠 3. Scoring",
-            "🚀 4. Despacho",
-            "📊 5. CRM",
+            "🌐 3. Web/Dolores",
+            "🧠 4. Scoring",
+            "🚀 5. Despacho",
+            "📊 6. CRM",
         ]
     )
     with tab1:
@@ -3300,10 +3948,12 @@ def main() -> None:
     with tab2:
         tab_enrichment(cfg)
     with tab3:
-        tab_scoring(cfg)
+        tab_research(cfg)
     with tab4:
-        tab_dispatch(cfg)
+        tab_scoring(cfg)
     with tab5:
+        tab_dispatch(cfg)
+    with tab6:
         tab_crm(cfg)
 
 
