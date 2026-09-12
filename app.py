@@ -984,6 +984,20 @@ def search_clay_leads(
             "clay_simulado",
         )
 
+    problem = _webhook_url_problem(webhook_url)
+    webhook_url = _normalize_webhook_url(webhook_url)
+    if problem or not webhook_url:
+        st.warning(
+            f"Webhook Clay/Make inválido ({problem or 'URL vacía'}). "
+            "No uses la URL de Streamlit (`*.streamlit.app/.../webhook`). "
+            "Creá un escenario Make/n8n con su propia URL que lea Clay y responda "
+            "`{leads:[{nombre,website,...}]}`."
+        )
+        return (
+            _mock_places_leads(nicho, ubicacion, cantidad, "clay_simulado_url_invalida"),
+            "clay_simulado_url_invalida",
+        )
+
     headers = {
         "Content-Type": "application/json",
         "Accept": "application/json",
@@ -1626,32 +1640,90 @@ def enrich_lead_email(lead: dict[str, Any], provider: str, api_key: str) -> dict
     return out
 
 
+
+def _is_absolute_http_url(url: str) -> bool:
+    u = _safe_str(url).strip()
+    return u.startswith("http://") or u.startswith("https://")
+
+
+def _normalize_webhook_url(url: str) -> str:
+    """Normaliza webhook; rechaza URLs relativas o la propia app Streamlit."""
+    u = _safe_str(url).strip()
+    if not u:
+        return ""
+    if not _is_absolute_http_url(u):
+        # Intento suave: agregar https si parece dominio
+        if re.match(r"^[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}(/.*)?$", u):
+            u = "https://" + u
+        else:
+            return ""
+    # La app Streamlit no es un receptor de webhooks Clay
+    low = u.lower()
+    if "streamlit.app" in low or low.rstrip("/").endswith("/webhook") and "make.com" not in low and "n8n" not in low and "clay.com" not in low and "hook." not in low:
+        # still allow make/n8n; block obvious streamlit self-url
+        if "streamlit.app" in low:
+            return ""
+    return u
+
+
+def _webhook_url_problem(url: str) -> str:
+    """Mensaje de diagnóstico si la URL de webhook es inválida para Clay/Make."""
+    raw = _safe_str(url).strip()
+    if not raw:
+        return "vacía"
+    if "streamlit.app" in raw.lower():
+        return (
+            "apunta a tu app Streamlit (no recibe webhooks Clay). "
+            "Usá una URL de Make/n8n que lea Clay y responda JSON"
+        )
+    if not _is_absolute_http_url(raw) and not _normalize_webhook_url(raw):
+        return "falta protocolo http:// o https://"
+    return ""
+
 def enrich_linkedin_via_clay(
     lead: dict[str, Any],
     webhook_url: str,
     api_key: str = "",
 ) -> dict[str, Any]:
     """
-    Pide a Clay (webhook) enriquecer LinkedIn company/person.
+    Pide a Make/n8n/Clay (webhook) enriquecer LinkedIn company/person.
     Contrato POST: {action: enrich_linkedin, lead: {...}}
     Response flexible: {linkedin|linkedin_url|company_linkedin: "..."}
+
+    Importante: la URL debe ser un webhook externo (Make/n8n), NO la URL
+    de la app Streamlit.
     """
     out = dict(lead)
-    if not webhook_url:
-        # Fallback: URL de búsqueda LinkedIn company
+
+    def _linkedin_heuristic() -> dict[str, Any]:
+        local = dict(lead)
         nombre = _safe_str(lead.get("nombre"))
         domain = _domain_from_website(_safe_str(lead.get("website")))
         if domain:
-            out["linkedin"] = f"https://www.linkedin.com/company/{domain.split('.')[0]}"
-            out["enrichment_fuente"] = (
-                (_safe_str(out.get("enrichment_fuente")) + "+linkedin_heuristica").strip("+")
+            local["linkedin"] = f"https://www.linkedin.com/company/{domain.split('.')[0]}"
+            local["enrichment_fuente"] = (
+                (_safe_str(local.get("enrichment_fuente")) + "+linkedin_heuristica").strip("+")
             )
         elif nombre:
             q = re.sub(r"\s+", "%20", nombre)
-            out["linkedin"] = f"https://www.linkedin.com/search/results/companies/?keywords={q}"
-            out["enrichment_fuente"] = (
-                (_safe_str(out.get("enrichment_fuente")) + "+linkedin_search").strip("+")
+            local["linkedin"] = f"https://www.linkedin.com/search/results/companies/?keywords={q}"
+            local["enrichment_fuente"] = (
+                (_safe_str(local.get("enrichment_fuente")) + "+linkedin_search").strip("+")
             )
+        return local
+
+    problem = _webhook_url_problem(webhook_url)
+    normalized = _normalize_webhook_url(webhook_url)
+    if problem or not normalized:
+        out = _linkedin_heuristic()
+        if problem:
+            out["enrichment_fuente"] = (
+                (_safe_str(out.get("enrichment_fuente")) + "+clay_linkedin_url_invalida").strip("+")
+            )
+            out["notas"] = (
+                _safe_str(out.get("notas"))
+                + f" | Clay LI: webhook {problem}. Pegá una URL Make/n8n, no la de Streamlit."
+            )[:300]
         return out
 
     headers = {
@@ -1676,7 +1748,7 @@ def enrich_linkedin_via_clay(
         "timestamp": _utc_now_iso(),
     }
     try:
-        resp = httpx.post(webhook_url, headers=headers, json=body, timeout=60.0)
+        resp = httpx.post(normalized, headers=headers, json=body, timeout=60.0)
         if resp.status_code >= 400:
             raise RuntimeError(
                 f"Clay LinkedIn HTTP {resp.status_code}: {_clay_response_preview(resp, 160)}"
@@ -2801,9 +2873,9 @@ def render_sidebar() -> dict[str, str]:
         "Clay / Make webhook (sourcing)",
         value=env_or_secret("CLAY_WEBHOOK_URL"),
         help=(
-            "URL que responde JSON con leads. "
-            "El Monitor webhook nativo de Clay NO sirve (solo ACK). "
-            "Usá Make/n8n que lea Clay y responda {leads:[...]}."
+            "URL de Make/n8n (ej. https://hook.eu1.make.com/...). "
+            "NO pongas la URL de Streamlit. "
+            "Monitor Clay nativo solo ACK — no sirve."
         ),
     )
     serpapi_key = st.sidebar.text_input(
@@ -2857,10 +2929,10 @@ def render_sidebar() -> dict[str, str]:
     )
     clay_linkedin_webhook = st.sidebar.text_input(
         "Clay / Make webhook (LinkedIn enrich)",
-        value=env_or_secret("CLAY_LINKEDIN_WEBHOOK_URL") or env_or_secret("CLAY_WEBHOOK_URL"),
+        value=env_or_secret("CLAY_LINKEDIN_WEBHOOK_URL"),
         help=(
-            "Webhook Make/n8n que responda JSON `{linkedin:\"https://...\"}`. "
-            "Monitor Clay nativo no devuelve LinkedIn síncrono. Sin URL → heurística."
+            "Webhook Make/n8n que responda `{linkedin:\"https://...\"}`. "
+            "NO uses *.streamlit.app. Vacío → LinkedIn heurístico."
         ),
     )
 
