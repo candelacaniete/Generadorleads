@@ -30,9 +30,8 @@ from dotenv import load_dotenv
 # ---------------------------------------------------------------------------
 load_dotenv()
 
-APP_TITLE = "SDR Autónomo · Katem / Guía Pilar"
-CRM_PATH = Path("./leads_crm.csv")
-DISPATCH_LOG_PATH = Path("./dispatch_log.csv")
+APP_TITLE = "SDR Autónomo · Katem"
+CLIENTS_DIR = Path("./clients")
 DEFAULT_CALENDAR_URL = "https://cal.com/katem"
 
 CRM_COLUMNS = [
@@ -41,6 +40,8 @@ CRM_COLUMNS = [
     "direccion",
     "telefono",
     "website",
+    "email",
+    "linkedin",
     "rating",
     "status_places",
     "rubro",
@@ -51,9 +52,61 @@ CRM_COLUMNS = [
     "pipeline_status",
     "calendario_url",
     "notas",
+    "client_id",
+    "enrichment_fuente",
     "fecha_creacion",
     "fecha_actualizacion",
 ]
+
+VERTICAL_TEMPLATES: dict[str, dict[str, Any]] = {
+    "directorios_locales": {
+        "label": "Directorios / comercios locales",
+        "default_nicho": "comercios y servicios locales",
+        "default_ubicacion": "Pilar",
+        "fuentes": ["Google Places", "Clay (webhook)", "CSV"],
+        "scoring_hint": "Cliente ideal para directorio local y servicios de presencia digital.",
+    },
+    "b2b_servicios": {
+        "label": "B2B servicios / agencias",
+        "default_nicho": "agencias de marketing",
+        "default_ubicacion": "Argentina",
+        "fuentes": ["Apollo.io", "Clay (webhook)", "Google Places"],
+        "scoring_hint": "Cliente ideal para automatización SDR, outbound y growth B2B.",
+    },
+    "profesionales": {
+        "label": "Profesionales / clínicas",
+        "default_nicho": "clínicas y profesionales de la salud",
+        "default_ubicacion": "Zona Norte GBA",
+        "fuentes": ["Google Places", "Clay (webhook)"],
+        "scoring_hint": "Cliente ideal para captación de pacientes y reputación online.",
+    },
+    "retail": {
+        "label": "Retail / e-commerce",
+        "default_nicho": "tiendas y e-commerce",
+        "default_ubicacion": "Buenos Aires",
+        "fuentes": ["Google Places", "Apollo.io", "Clay (webhook)"],
+        "scoring_hint": "Cliente ideal para performance ads, CRM y recuperación de carrito.",
+    },
+}
+
+DEFAULT_CLIENTS: dict[str, dict[str, Any]] = {
+    "katem-demo": {
+        "id": "katem-demo",
+        "name": "Katem Demo",
+        "vertical": "b2b_servicios",
+        "calendar_url": DEFAULT_CALENDAR_URL,
+        "brand": "Katem",
+        "notes": "Workspace demo de la vertical SDR Autónomo.",
+    },
+    "guia-pilar": {
+        "id": "guia-pilar",
+        "name": "Guía Pilar",
+        "vertical": "directorios_locales",
+        "calendar_url": "https://cal.com/katem",
+        "brand": "Guía Pilar",
+        "notes": "Cliente ejemplo — directorio local Pilar.",
+    },
+}
 
 DISPATCH_COLUMNS = [
     "timestamp",
@@ -87,18 +140,102 @@ def _safe_str(value: Any) -> str:
     return str(value).strip()
 
 
+def ensure_clients_seeded() -> None:
+    """Crea carpeta clients/ y workspaces demo si no existen."""
+    CLIENTS_DIR.mkdir(parents=True, exist_ok=True)
+    for cid, meta in DEFAULT_CLIENTS.items():
+        cdir = CLIENTS_DIR / cid
+        cdir.mkdir(parents=True, exist_ok=True)
+        cfg_path = cdir / "client.json"
+        if not cfg_path.exists():
+            cfg_path.write_text(json.dumps(meta, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
+def list_clients() -> list[dict[str, Any]]:
+    ensure_clients_seeded()
+    clients: list[dict[str, Any]] = []
+    for p in sorted(CLIENTS_DIR.glob("*/client.json")):
+        try:
+            data = json.loads(p.read_text(encoding="utf-8"))
+            data.setdefault("id", p.parent.name)
+            clients.append(data)
+        except Exception:  # noqa: BLE001
+            clients.append({"id": p.parent.name, "name": p.parent.name, "vertical": "b2b_servicios"})
+    return clients
+
+
+def get_client(client_id: str) -> dict[str, Any]:
+    ensure_clients_seeded()
+    cfg_path = CLIENTS_DIR / client_id / "client.json"
+    if cfg_path.exists():
+        try:
+            data = json.loads(cfg_path.read_text(encoding="utf-8"))
+            data.setdefault("id", client_id)
+            return data
+        except Exception:  # noqa: BLE001
+            pass
+    return DEFAULT_CLIENTS.get(client_id, {"id": client_id, "name": client_id, "vertical": "b2b_servicios"})
+
+
+def save_client(meta: dict[str, Any]) -> None:
+    cid = _safe_str(meta.get("id")) or "cliente"
+    cdir = CLIENTS_DIR / cid
+    cdir.mkdir(parents=True, exist_ok=True)
+    meta = {**meta, "id": cid}
+    (cdir / "client.json").write_text(json.dumps(meta, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
+def get_crm_path(client_id: str | None = None) -> Path:
+    cid = client_id or st.session_state.get("active_client_id", "katem-demo")
+    cdir = CLIENTS_DIR / cid
+    cdir.mkdir(parents=True, exist_ok=True)
+    return cdir / "leads_crm.csv"
+
+
+def get_dispatch_log_path(client_id: str | None = None) -> Path:
+    cid = client_id or st.session_state.get("active_client_id", "katem-demo")
+    cdir = CLIENTS_DIR / cid
+    cdir.mkdir(parents=True, exist_ok=True)
+    return cdir / "dispatch_log.csv"
+
+
+def reset_pipeline_state_for_client() -> None:
+    """Limpia estado de pipeline al cambiar de workspace."""
+    st.session_state.sourced_leads = pd.DataFrame()
+    st.session_state.selected_lead_ids = []
+    st.session_state.scored_leads = pd.DataFrame()
+    st.session_state.high_leads = pd.DataFrame()
+    st.session_state.enriched_leads = pd.DataFrame()
+    st.session_state.last_search_meta = {}
+    st.session_state.pipeline_step = 1
+    st.session_state.step1_approved = False
+    st.session_state.step2_approved = False
+    st.session_state.step_enrich_approved = False
+    st.session_state.scoring_queue_ids = []
+    st.session_state.scoring_queue_idx = 0
+    st.session_state.scoring_current_result = None
+    st.session_state.dispatch_queue_ids = []
+    st.session_state.dispatch_queue_idx = 0
+    st.session_state.dispatch_approved_ids = []
+    st.session_state.dispatch_log = load_dispatch_log()
+
+
 def init_session_state() -> None:
+    ensure_clients_seeded()
     defaults: dict[str, Any] = {
+        "active_client_id": "katem-demo",
         "sourced_leads": pd.DataFrame(),
         "selected_lead_ids": [],
+        "enriched_leads": pd.DataFrame(),
         "scored_leads": pd.DataFrame(),
         "high_leads": pd.DataFrame(),
-        "dispatch_log": load_dispatch_log(),
+        "dispatch_log": pd.DataFrame(columns=DISPATCH_COLUMNS),
         "last_search_meta": {},
         "api_errors": [],
-        # Pipeline supervisado por pasos
-        "pipeline_step": 1,  # 1 sourcing, 2 scoring, 3 dispatch, 4 crm
+        # Pipeline: 1 sourcing → 2 enrich → 3 scoring → 4 dispatch → 5 crm
+        "pipeline_step": 1,
         "step1_approved": False,
+        "step_enrich_approved": False,
         "step2_approved": False,
         "scoring_mode": "Uno a uno (supervisado)",
         "scoring_queue_ids": [],
@@ -108,16 +245,23 @@ def init_session_state() -> None:
         "dispatch_queue_ids": [],
         "dispatch_queue_idx": 0,
         "dispatch_approved_ids": [],
+        "enrich_mode": "Uno a uno (supervisado)",
+        "enrich_queue_ids": [],
+        "enrich_queue_idx": 0,
     }
     for key, value in defaults.items():
         if key not in st.session_state:
             st.session_state[key] = value
+    # Cargar log del cliente activo
+    if st.session_state.dispatch_log.empty:
+        st.session_state.dispatch_log = load_dispatch_log()
 
 
 def load_crm() -> pd.DataFrame:
-    if CRM_PATH.exists():
+    crm_path = get_crm_path()
+    if crm_path.exists():
         try:
-            df = pd.read_csv(CRM_PATH, dtype=str).fillna("")
+            df = pd.read_csv(crm_path, dtype=str).fillna("")
             for col in CRM_COLUMNS:
                 if col not in df.columns:
                     df[col] = ""
@@ -132,13 +276,18 @@ def save_crm(df: pd.DataFrame) -> None:
     for col in CRM_COLUMNS:
         if col not in out.columns:
             out[col] = ""
-    out[CRM_COLUMNS].to_csv(CRM_PATH, index=False)
+    cid = st.session_state.get("active_client_id", "")
+    if "client_id" in out.columns:
+        out["client_id"] = out["client_id"].replace("", cid)
+        out.loc[out["client_id"].astype(str).str.len() == 0, "client_id"] = cid
+    out[CRM_COLUMNS].to_csv(get_crm_path(), index=False)
 
 
 def load_dispatch_log() -> pd.DataFrame:
-    if DISPATCH_LOG_PATH.exists():
+    log_path = get_dispatch_log_path()
+    if log_path.exists():
         try:
-            df = pd.read_csv(DISPATCH_LOG_PATH, dtype=str).fillna("")
+            df = pd.read_csv(log_path, dtype=str).fillna("")
             for col in DISPATCH_COLUMNS:
                 if col not in df.columns:
                     df[col] = ""
@@ -159,7 +308,7 @@ def append_dispatch_log(rows: list[dict[str, Any]]) -> pd.DataFrame:
         if col not in combined.columns:
             combined[col] = ""
     combined = combined[DISPATCH_COLUMNS].fillna("")
-    combined.to_csv(DISPATCH_LOG_PATH, index=False)
+    combined.to_csv(get_dispatch_log_path(), index=False)
     st.session_state.dispatch_log = combined
     return combined
 
@@ -681,6 +830,263 @@ def search_leads(
 
 
 # ---------------------------------------------------------------------------
+# Enrichment: Email (Hunter/Snov/heurística) + LinkedIn vía Clay
+# ---------------------------------------------------------------------------
+def _domain_from_website(website: str) -> str:
+    w = _safe_str(website).lower()
+    w = re.sub(r"^https?://", "", w)
+    w = re.sub(r"^www\.", "", w)
+    return w.split("/")[0].strip()
+
+
+def _heuristic_emails(domain: str, company_name: str = "") -> list[str]:
+    if not domain or "." not in domain:
+        return []
+    locals_ = ["info", "contacto", "hola", "admin", "ventas", "comercial"]
+    # Si el nombre parece persona, no inventamos name@ — solo genéricos
+    return [f"{local}@{domain}" for local in locals_[:3]]
+
+
+def enrich_email_hunter(domain: str, api_key: str) -> dict[str, Any]:
+    """Domain search en Hunter.io. Retorna email principal + confianza."""
+    url = "https://api.hunter.io/v2/domain-search"
+    params = {"domain": domain, "api_key": api_key, "limit": 5}
+    resp = httpx.get(url, params=params, timeout=30.0)
+    resp.raise_for_status()
+    data = resp.json().get("data", {})
+    emails = data.get("emails") or []
+    if not emails:
+        return {"email": "", "confidence": 0, "fuente": "hunter_empty", "raw_count": 0}
+    # Prioriza type=generic o mayor confidence
+    emails_sorted = sorted(emails, key=lambda e: int(e.get("confidence") or 0), reverse=True)
+    top = emails_sorted[0]
+    return {
+        "email": _safe_str(top.get("value")),
+        "confidence": int(top.get("confidence") or 0),
+        "fuente": "hunter",
+        "raw_count": len(emails),
+    }
+
+
+def enrich_email_snov(domain: str, api_key: str) -> dict[str, Any]:
+    """
+    Snov.io domain emails (API v1).
+    Nota: Snov suele requerir OAuth; si falla, el caller hace fallback heurístico.
+    """
+    # Intento simple con token como query (algunos planes legacy)
+    url = "https://api.snov.io/v1/get-domain-emails-with-info"
+    params = {"domain": domain, "access_token": api_key, "type": "all", "limit": 5}
+    resp = httpx.get(url, params=params, timeout=30.0)
+    if resp.status_code >= 400:
+        raise RuntimeError(f"Snov HTTP {resp.status_code}: {resp.text[:200]}")
+    payload = resp.json()
+    emails = payload.get("emails") or payload.get("data") or []
+    if not emails:
+        return {"email": "", "confidence": 0, "fuente": "snov_empty", "raw_count": 0}
+    top = emails[0] if isinstance(emails[0], dict) else {"email": str(emails[0])}
+    return {
+        "email": _safe_str(top.get("email") or top.get("value")),
+        "confidence": int(top.get("probability") or top.get("confidence") or 50),
+        "fuente": "snov",
+        "raw_count": len(emails),
+    }
+
+
+def enrich_lead_email(lead: dict[str, Any], provider: str, api_key: str) -> dict[str, Any]:
+    """Enriquece un lead con email. Siempre retorna el lead mergeado."""
+    out = dict(lead)
+    domain = _domain_from_website(_safe_str(lead.get("website")))
+    if not domain:
+        out["email"] = _safe_str(out.get("email"))
+        out["enrichment_fuente"] = _safe_str(out.get("enrichment_fuente")) or "email_sin_dominio"
+        return out
+
+    try:
+        if provider.startswith("Hunter") and api_key:
+            result = enrich_email_hunter(domain, api_key)
+        elif provider.startswith("Snov") and api_key:
+            result = enrich_email_snov(domain, api_key)
+        else:
+            guesses = _heuristic_emails(domain, _safe_str(lead.get("nombre")))
+            result = {
+                "email": guesses[0] if guesses else "",
+                "confidence": 20 if guesses else 0,
+                "fuente": "heuristica_email",
+                "raw_count": len(guesses),
+            }
+    except Exception as exc:  # noqa: BLE001
+        guesses = _heuristic_emails(domain, _safe_str(lead.get("nombre")))
+        result = {
+            "email": guesses[0] if guesses else "",
+            "confidence": 15 if guesses else 0,
+            "fuente": f"email_fallback:{exc}",
+            "raw_count": len(guesses),
+        }
+
+    if result.get("email"):
+        out["email"] = result["email"]
+    fuentes = [x for x in [_safe_str(out.get("enrichment_fuente")), _safe_str(result.get("fuente"))] if x]
+    out["enrichment_fuente"] = "+".join(dict.fromkeys(fuentes))
+    out["email_confidence"] = str(result.get("confidence", ""))
+    return out
+
+
+def enrich_linkedin_via_clay(
+    lead: dict[str, Any],
+    webhook_url: str,
+    api_key: str = "",
+) -> dict[str, Any]:
+    """
+    Pide a Clay (webhook) enriquecer LinkedIn company/person.
+    Contrato POST: {action: enrich_linkedin, lead: {...}}
+    Response flexible: {linkedin|linkedin_url|company_linkedin: "..."}
+    """
+    out = dict(lead)
+    if not webhook_url:
+        # Fallback: URL de búsqueda LinkedIn company
+        nombre = _safe_str(lead.get("nombre"))
+        domain = _domain_from_website(_safe_str(lead.get("website")))
+        if domain:
+            out["linkedin"] = f"https://www.linkedin.com/company/{domain.split('.')[0]}"
+            out["enrichment_fuente"] = (
+                (_safe_str(out.get("enrichment_fuente")) + "+linkedin_heuristica").strip("+")
+            )
+        elif nombre:
+            q = re.sub(r"\s+", "%20", nombre)
+            out["linkedin"] = f"https://www.linkedin.com/search/results/companies/?keywords={q}"
+            out["enrichment_fuente"] = (
+                (_safe_str(out.get("enrichment_fuente")) + "+linkedin_search").strip("+")
+            )
+        return out
+
+    headers = {"Content-Type": "application/json"}
+    if api_key:
+        headers["Authorization"] = f"Bearer {api_key}"
+        headers["x-clay-api-key"] = api_key
+    body = {
+        "action": "enrich_linkedin",
+        "lead": {
+            "id": _safe_str(lead.get("id")),
+            "nombre": _safe_str(lead.get("nombre")),
+            "website": _safe_str(lead.get("website")),
+            "ubicacion": _safe_str(lead.get("ubicacion")),
+            "rubro": _safe_str(lead.get("rubro")),
+            "email": _safe_str(lead.get("email")),
+        },
+        "source": "katem_sdr_autonomo",
+        "timestamp": _utc_now_iso(),
+    }
+    try:
+        resp = httpx.post(webhook_url, headers=headers, json=body, timeout=60.0)
+        if resp.status_code >= 400:
+            raise RuntimeError(f"Clay LinkedIn HTTP {resp.status_code}")
+        payload = resp.json()
+        # Normalizar
+        linkedin = ""
+        if isinstance(payload, dict):
+            linkedin = _safe_str(
+                payload.get("linkedin")
+                or payload.get("linkedin_url")
+                or payload.get("company_linkedin")
+                or (payload.get("lead") or {}).get("linkedin")
+            )
+            # rows[0]
+            if not linkedin:
+                rows = payload.get("rows") or payload.get("leads") or payload.get("results") or []
+                if rows and isinstance(rows[0], dict):
+                    r0 = rows[0].get("fields") or rows[0]
+                    linkedin = _safe_str(
+                        r0.get("linkedin") or r0.get("LinkedIn") or r0.get("linkedin_url")
+                    )
+        if linkedin:
+            out["linkedin"] = linkedin
+            out["enrichment_fuente"] = (
+                (_safe_str(out.get("enrichment_fuente")) + "+clay_linkedin").strip("+")
+            )
+        else:
+            # fallback heurístico si Clay no trajo dato
+            return enrich_linkedin_via_clay(lead, "", "")
+    except Exception as exc:  # noqa: BLE001
+        out = enrich_linkedin_via_clay(lead, "", "")
+        out["enrichment_fuente"] = (
+            (_safe_str(out.get("enrichment_fuente")) + f"+clay_linkedin_error").strip("+")
+        )
+        out["notas"] = (_safe_str(out.get("notas")) + f" | Clay LI error: {exc}")[:300]
+    return out
+
+
+def enrich_one_lead(
+    lead: dict[str, Any],
+    email_provider: str,
+    email_api_key: str,
+    do_email: bool,
+    do_linkedin: bool,
+    clay_linkedin_webhook: str,
+    clay_key: str,
+) -> dict[str, Any]:
+    out = dict(lead)
+    if do_email:
+        out = enrich_lead_email(out, email_provider, email_api_key)
+    if do_linkedin:
+        out = enrich_linkedin_via_clay(out, clay_linkedin_webhook, clay_key)
+    return out
+
+
+def enrich_leads_batch(
+    leads_df: pd.DataFrame,
+    email_provider: str,
+    email_api_key: str,
+    do_email: bool,
+    do_linkedin: bool,
+    clay_linkedin_webhook: str,
+    clay_key: str,
+) -> pd.DataFrame:
+    rows = []
+    total = max(len(leads_df), 1)
+    progress = st.progress(0.0, text="Enriqueciendo leads…")
+    for idx, (_, row) in enumerate(leads_df.iterrows()):
+        enriched = enrich_one_lead(
+            row.to_dict(),
+            email_provider,
+            email_api_key,
+            do_email,
+            do_linkedin,
+            clay_linkedin_webhook,
+            clay_key,
+        )
+        rows.append(enriched)
+        progress.progress((idx + 1) / total, text=f"Enriquecidos {idx + 1}/{len(leads_df)}")
+    progress.empty()
+    return pd.DataFrame(rows)
+
+
+def upsert_enriched_lead(lead: dict[str, Any]) -> None:
+    """Actualiza sourced_leads / enriched_leads con el lead enriquecido."""
+    lid = _safe_str(lead.get("id"))
+    enriched = st.session_state.get("enriched_leads", pd.DataFrame())
+    row = pd.DataFrame([lead])
+    if not isinstance(enriched, pd.DataFrame) or enriched.empty:
+        st.session_state.enriched_leads = row
+    else:
+        if lid and (enriched["id"].astype(str) == lid).any():
+            enriched = enriched[enriched["id"].astype(str) != lid]
+        st.session_state.enriched_leads = pd.concat([enriched, row], ignore_index=True)
+
+    # Sync back into sourced_leads
+    sourced = st.session_state.sourced_leads
+    if isinstance(sourced, pd.DataFrame) and not sourced.empty and lid:
+        for col, val in lead.items():
+            if col == "seleccionado":
+                continue
+            if col not in sourced.columns:
+                sourced[col] = ""
+            sourced.loc[sourced["id"].astype(str) == lid, col] = val
+        st.session_state.sourced_leads = sourced
+
+
+
+
+# ---------------------------------------------------------------------------
 # Integración: OpenAI / Anthropic — Lead Scoring B2B
 # ---------------------------------------------------------------------------
 SCORING_SYSTEM_PROMPT = """Eres un analista senior de calificación de leads B2B para Katem
@@ -1148,81 +1554,145 @@ def dataframe_to_excel_bytes(df: pd.DataFrame) -> bytes:
 # ---------------------------------------------------------------------------
 # UI — Sidebar config
 # ---------------------------------------------------------------------------
+
 def render_sidebar() -> dict[str, str]:
-    st.sidebar.markdown("### ⚙️ Configuración de APIs")
-    st.sidebar.caption("Las keys se cargan desde `.env` y pueden sobreescribirse aquí (solo sesión).")
+    st.sidebar.markdown("### 🏢 Cliente / Workspace")
+    clients = list_clients()
+    labels = {c["id"]: f"{c.get('name', c['id'])} · {VERTICAL_TEMPLATES.get(c.get('vertical',''), {}).get('label', c.get('vertical',''))}" for c in clients}
+    ids = list(labels.keys())
+    current = st.session_state.get("active_client_id", ids[0] if ids else "katem-demo")
+    if current not in ids and ids:
+        current = ids[0]
+    selected = st.sidebar.selectbox(
+        "Cliente activo",
+        options=ids,
+        index=ids.index(current) if current in ids else 0,
+        format_func=lambda i: labels.get(i, i),
+        key="sidebar_client_select",
+    )
+    if selected != st.session_state.get("active_client_id"):
+        st.session_state.active_client_id = selected
+        reset_pipeline_state_for_client()
+        st.rerun()
+
+    client = get_client(selected)
+    vertical = client.get("vertical", "b2b_servicios")
+    st.sidebar.caption(f"Vertical: **{VERTICAL_TEMPLATES.get(vertical, {}).get('label', vertical)}**")
+    st.sidebar.caption(client.get("notes", ""))
+
+    with st.sidebar.expander("➕ Nuevo cliente"):
+        new_id = st.text_input("ID (slug)", value="", placeholder="cliente-acme")
+        new_name = st.text_input("Nombre comercial", value="")
+        new_vertical = st.selectbox(
+            "Template de vertical",
+            options=list(VERTICAL_TEMPLATES.keys()),
+            format_func=lambda k: VERTICAL_TEMPLATES[k]["label"],
+        )
+        new_cal = st.text_input("Calendario", value=DEFAULT_CALENDAR_URL)
+        if st.button("Crear workspace", use_container_width=True):
+            slug = re.sub(r"[^a-z0-9\-]+", "-", (new_id or new_name).lower()).strip("-")
+            if not slug or not new_name.strip():
+                st.error("Completá ID y nombre.")
+            elif (CLIENTS_DIR / slug / "client.json").exists():
+                st.error("Ese ID ya existe.")
+            else:
+                save_client(
+                    {
+                        "id": slug,
+                        "name": new_name.strip(),
+                        "vertical": new_vertical,
+                        "calendar_url": new_cal.strip() or DEFAULT_CALENDAR_URL,
+                        "brand": new_name.strip(),
+                        "notes": f"Workspace creado desde panel Katem · vertical {new_vertical}",
+                    }
+                )
+                st.session_state.active_client_id = slug
+                reset_pipeline_state_for_client()
+                st.success(f"Cliente `{slug}` creado.")
+                st.rerun()
+
+    st.sidebar.divider()
+    st.sidebar.markdown("### ⚙️ APIs")
+    st.sidebar.caption("Keys desde `.env` (override de sesión).")
 
     st.sidebar.markdown("#### Sourcing")
     google_key = st.sidebar.text_input(
         "Google Maps / Places Key",
         value=env_or_secret("GOOGLE_MAPS_KEY"),
         type="password",
-        help="Si está vacío, Places usa extracción simulada.",
     )
     apollo_key = st.sidebar.text_input(
         "Apollo.io API Key",
         value=env_or_secret("APOLLO_API_KEY"),
         type="password",
-        help="Organization Search de Apollo. Sin key → simulación Apollo.",
     )
     clay_key = st.sidebar.text_input(
         "Clay API Key",
         value=env_or_secret("CLAY_API_KEY"),
         type="password",
-        help="Opcional. Se envía como Bearer al webhook de Clay.",
     )
     clay_webhook_url = st.sidebar.text_input(
-        "Clay Webhook URL (tabla/workbook)",
+        "Clay Webhook URL (sourcing)",
         value=env_or_secret("CLAY_WEBHOOK_URL"),
-        help="Webhook de Clay que recibe {nicho, ubicacion, cantidad} y devuelve leads JSON.",
+        help="Webhook Clay para buscar/traer leads.",
+    )
+
+    st.sidebar.markdown("#### Enrichment")
+    hunter_key = st.sidebar.text_input(
+        "Hunter.io API Key",
+        value=env_or_secret("HUNTER_API_KEY"),
+        type="password",
+        help="Domain search para emails. Sin key → heurística info@dominio.",
+    )
+    snov_key = st.sidebar.text_input(
+        "Snov.io API Key / token",
+        value=env_or_secret("SNOV_API_KEY"),
+        type="password",
+    )
+    clay_linkedin_webhook = st.sidebar.text_input(
+        "Clay Webhook URL (LinkedIn enrich)",
+        value=env_or_secret("CLAY_LINKEDIN_WEBHOOK_URL") or env_or_secret("CLAY_WEBHOOK_URL"),
+        help="Webhook Clay con action=enrich_linkedin. Sin URL → LinkedIn heurístico.",
     )
 
     st.sidebar.markdown("#### Scoring / Outbound")
-    openai_key = st.sidebar.text_input(
-        "OpenAI API Key",
-        value=env_or_secret("OPENAI_API_KEY"),
-        type="password",
-    )
-    anthropic_key = st.sidebar.text_input(
-        "Anthropic API Key",
-        value=env_or_secret("ANTHROPIC_API_KEY"),
-        type="password",
-    )
+    openai_key = st.sidebar.text_input("OpenAI API Key", value=env_or_secret("OPENAI_API_KEY"), type="password")
+    anthropic_key = st.sidebar.text_input("Anthropic API Key", value=env_or_secret("ANTHROPIC_API_KEY"), type="password")
     instantly_key = st.sidebar.text_input(
         "Instantly / Smartlead API Key",
         value=env_or_secret("INSTANTLY_API_KEY") or env_or_secret("SMARTLEAD_API_KEY"),
         type="password",
     )
-    webhook_url = st.sidebar.text_input(
-        "Webhook Make / n8n",
-        value=env_or_secret("WEBHOOK_URL"),
-        help="URL completa del webhook receptor outbound.",
-    )
-    campaign_id = st.sidebar.text_input(
-        "Campaign ID (Instantly / Smartlead)",
-        value=env_or_secret("INSTANTLY_CAMPAIGN_ID"),
-    )
+    webhook_url = st.sidebar.text_input("Webhook Make / n8n", value=env_or_secret("WEBHOOK_URL"))
+    campaign_id = st.sidebar.text_input("Campaign ID", value=env_or_secret("INSTANTLY_CAMPAIGN_ID"))
     calendar_url = st.sidebar.text_input(
-        "Enlace Cal.com / Calendly",
-        value=env_or_secret("CALENDAR_URL", DEFAULT_CALENDAR_URL),
+        "Cal.com / Calendly",
+        value=client.get("calendar_url") or env_or_secret("CALENDAR_URL", DEFAULT_CALENDAR_URL),
     )
 
     st.sidebar.divider()
-    st.sidebar.markdown("**Katem** · [katem.com.ar](https://katem.com.ar)")
-    st.sidebar.markdown("**Guía Pilar** · [guia-pilar.com](https://guia-pilar.com)")
+    st.sidebar.markdown("**Katem** · vertical SDR Autónomo")
+    st.sidebar.caption("Multi-cliente · Guía Pilar es un workspace, no el producto.")
 
     return {
         "google_key": google_key.strip(),
         "apollo_key": apollo_key.strip(),
         "clay_key": clay_key.strip(),
         "clay_webhook_url": clay_webhook_url.strip(),
+        "hunter_key": hunter_key.strip(),
+        "snov_key": snov_key.strip(),
+        "clay_linkedin_webhook": clay_linkedin_webhook.strip(),
         "openai_key": openai_key.strip(),
         "anthropic_key": anthropic_key.strip(),
         "instantly_key": instantly_key.strip(),
         "webhook_url": webhook_url.strip(),
         "campaign_id": campaign_id.strip(),
         "calendar_url": calendar_url.strip() or DEFAULT_CALENDAR_URL,
+        "client_id": selected,
+        "client_name": _safe_str(client.get("name")),
+        "vertical": vertical,
     }
+
 
 
 # ---------------------------------------------------------------------------
@@ -1253,46 +1723,41 @@ def upsert_scored_lead(lead: dict[str, Any]) -> None:
     st.session_state.high_leads = scored_all[scored_all["lead_score"] == "High"].copy()
 
 
+
 def render_pipeline_stepper() -> None:
-    """Barra de progreso del pipeline supervisado (paso a paso)."""
+    """Barra de progreso del pipeline supervisado multi-paso."""
     steps = [
         (1, "🔍 Sourcing"),
-        (2, "🧠 Scoring"),
-        (3, "🚀 Despacho"),
-        (4, "📊 CRM"),
+        (2, "✨ Enrich"),
+        (3, "🧠 Scoring"),
+        (4, "🚀 Despacho"),
+        (5, "📊 CRM"),
     ]
     current = int(st.session_state.get("pipeline_step", 1))
-    cols = st.columns(4)
+    cols = st.columns(5)
     for (num, label), col in zip(steps, cols):
         if num < current:
             col.success(f"✓ {label}")
         elif num == current:
-            col.info(f"▶ Paso {num}: {label}")
+            col.info(f"▶ {label}")
         else:
             col.caption(f"○ {label}")
 
     c1, c2, c3 = st.columns([2, 1, 1])
     with c1:
+        client = get_client(st.session_state.get("active_client_id", "katem-demo"))
         st.caption(
-            "Modo supervisado: cada etapa requiere tu revisión y aprobación explícita "
-            "antes de avanzar. Podés calificar y despachar de a uno."
+            f"Workspace **{client.get('name')}** · modo supervisado "
+            "(cada etapa requiere aprobación explícita)."
         )
     with c2:
         if st.button("↺ Reiniciar pipeline", use_container_width=True):
-            st.session_state.pipeline_step = 1
-            st.session_state.step1_approved = False
-            st.session_state.step2_approved = False
-            st.session_state.scoring_queue_ids = []
-            st.session_state.scoring_queue_idx = 0
-            st.session_state.scoring_current_result = None
-            st.session_state.dispatch_queue_ids = []
-            st.session_state.dispatch_queue_idx = 0
-            st.session_state.dispatch_approved_ids = []
+            reset_pipeline_state_for_client()
             st.rerun()
     with c3:
         jump = st.selectbox(
             "Ir al paso",
-            options=[1, 2, 3, 4],
+            options=[1, 2, 3, 4, 5],
             format_func=lambda n: steps[n - 1][1],
             index=current - 1,
             label_visibility="collapsed",
@@ -1301,6 +1766,7 @@ def render_pipeline_stepper() -> None:
             st.session_state.pipeline_step = int(jump)
             st.rerun()
     st.divider()
+
 
 
 def tab_sourcing(cfg: dict[str, str]) -> None:
@@ -1439,14 +1905,14 @@ def tab_sourcing(cfg: dict[str, str]) -> None:
             mime="text/csv",
         )
 
-        st.markdown("#### Puerta de aprobación — Paso 1 → Paso 2")
+        st.markdown("#### Puerta de aprobación — Paso 1 → Paso 2 (Enrichment)")
         n_sel = len(st.session_state.selected_lead_ids) or len(edited)
         confirm = st.checkbox(
             f"Revisé la lista y quiero calificar {n_sel} lead(s) en el siguiente paso",
             key="confirm_step1",
         )
         if st.button(
-            "Aprobar selección y pasar a Scoring →",
+            "Aprobar selección y pasar a Enrichment →",
             type="primary",
             use_container_width=True,
             disabled=not confirm,
@@ -1459,21 +1925,208 @@ def tab_sourcing(cfg: dict[str, str]) -> None:
                 st.session_state.sourced_leads = edited
                 st.session_state.selected_lead_ids = ids
             st.session_state.step1_approved = True
+            st.session_state.step_enrich_approved = False
             st.session_state.pipeline_step = 2
+            st.session_state.enrich_queue_ids = list(ids)
+            st.session_state.enrich_queue_idx = 0
             st.session_state.scoring_queue_ids = list(ids)
             st.session_state.scoring_queue_idx = 0
             st.session_state.scoring_current_result = None
-            st.success("Paso 1 aprobado. Continuá en la pestaña Scoring.")
+            # seed enriched with selected rows
+            sourced = st.session_state.sourced_leads
+            selected_df = sourced[sourced["id"].astype(str).isin([str(i) for i in ids])].copy()
+            for col in ("email", "linkedin", "enrichment_fuente", "email_confidence"):
+                if col not in selected_df.columns:
+                    selected_df[col] = ""
+            st.session_state.enriched_leads = selected_df.drop(columns=["seleccionado"], errors="ignore")
+            st.success("Paso 1 aprobado. Continuá en Enrichment (email + LinkedIn).")
             st.rerun()
 
         if st.session_state.step1_approved:
-            st.success("✓ Paso 1 aprobado — podés trabajar en Scoring.")
+            st.success("✓ Paso 1 aprobado — podés enriquecer en la pestaña Enrichment.")
     else:
         st.info("Todavía no hay leads. Completá el formulario y tocá **Buscar leads**.")
 
 
+
+def tab_enrichment(cfg: dict[str, str]) -> None:
+    st.subheader("✨ Paso 2 — Enrichment (Email + LinkedIn)")
+    st.write(
+        "Enriquecé los leads aprobados con **email** (Hunter/Snov/heurística) y "
+        "**LinkedIn vía Clay**. Revisá uno a uno o en lote, y aprobá para pasar a scoring."
+    )
+
+    if not st.session_state.step1_approved:
+        st.warning("Primero aprobá la selección en **Paso 1 (Sourcing)**.")
+        if st.button("Ir a Sourcing", key="enrich_go_sourcing"):
+            st.session_state.pipeline_step = 1
+            st.rerun()
+        return
+
+    base = st.session_state.get("enriched_leads", pd.DataFrame())
+    if not isinstance(base, pd.DataFrame) or base.empty:
+        base = get_selected_sourced_leads().drop(columns=["seleccionado"], errors="ignore")
+        for col in ("email", "linkedin", "enrichment_fuente", "email_confidence"):
+            if col not in base.columns:
+                base[col] = ""
+        st.session_state.enriched_leads = base.copy()
+        if not st.session_state.enrich_queue_ids and not base.empty:
+            st.session_state.enrich_queue_ids = base["id"].astype(str).tolist()
+            st.session_state.enrich_queue_idx = 0
+
+    if base.empty:
+        st.warning("No hay leads para enriquecer.")
+        return
+
+    c1, c2, c3 = st.columns(3)
+    with c1:
+        do_email = st.checkbox("Enriquecer email", value=True)
+        email_provider = st.selectbox(
+            "Proveedor email",
+            ["Heurística local", "Hunter.io", "Snov.io"],
+        )
+    with c2:
+        do_linkedin = st.checkbox("Enriquecer LinkedIn (Clay)", value=True)
+        st.caption("Sin webhook Clay → URL company/search heurística.")
+    with c3:
+        mode = st.radio(
+            "Modo",
+            ["Uno a uno (supervisado)", "Lote completo (con confirmación)"],
+            horizontal=False,
+            key="enrich_mode_radio",
+        )
+    st.session_state.enrich_mode = mode
+    st.metric("Leads en cola", len(base))
+
+    email_key = cfg.get("hunter_key", "") if email_provider.startswith("Hunter") else cfg.get("snov_key", "")
+    clay_li = cfg.get("clay_linkedin_webhook", "")
+    clay_key = cfg.get("clay_key", "")
+
+    # ---- Uno a uno ----
+    if mode.startswith("Uno a uno"):
+        queue = st.session_state.enrich_queue_ids or base["id"].astype(str).tolist()
+        if not st.session_state.enrich_queue_ids:
+            st.session_state.enrich_queue_ids = queue
+            st.session_state.enrich_queue_idx = 0
+        idx = int(st.session_state.enrich_queue_idx)
+        total_q = len(st.session_state.enrich_queue_ids)
+        if idx >= total_q:
+            st.success(f"Cola de enrichment finalizada ({total_q}/{total_q}).")
+        else:
+            lead_id = str(st.session_state.enrich_queue_ids[idx])
+            lead_row = base[base["id"].astype(str) == lead_id]
+            if lead_row.empty:
+                st.session_state.enrich_queue_idx = idx + 1
+                st.rerun()
+            lead = lead_row.iloc[0].to_dict()
+            st.markdown(f"##### Lead {idx + 1} de {total_q}: **{_safe_str(lead.get('nombre'))}**")
+            st.write(
+                {
+                    "website": lead.get("website"),
+                    "email": lead.get("email"),
+                    "linkedin": lead.get("linkedin"),
+                    "telefono": lead.get("telefono"),
+                }
+            )
+            b1, b2, b3 = st.columns(3)
+            with b1:
+                if st.button("Enriquecer este lead", type="primary", use_container_width=True, key="enrich_one_btn"):
+                    enriched = enrich_one_lead(
+                        lead,
+                        email_provider,
+                        email_key,
+                        do_email,
+                        do_linkedin,
+                        clay_li,
+                        clay_key,
+                    )
+                    upsert_enriched_lead(enriched)
+                    st.success(
+                        f"Email: `{enriched.get('email') or '—'}` · "
+                        f"LinkedIn: `{enriched.get('linkedin') or '—'}`"
+                    )
+                    st.rerun()
+            with b2:
+                if st.button("Guardar y siguiente →", use_container_width=True, key="enrich_next_btn"):
+                    st.session_state.enrich_queue_idx = idx + 1
+                    st.rerun()
+            with b3:
+                if st.button("Omitir →", use_container_width=True, key="enrich_skip_btn"):
+                    st.session_state.enrich_queue_idx = idx + 1
+                    st.rerun()
+
+            # editable fields
+            edited_email = st.text_input("Email (editable)", value=_safe_str(lead.get("email")), key=f"enr_email_{lead_id}")
+            edited_li = st.text_input("LinkedIn (editable)", value=_safe_str(lead.get("linkedin")), key=f"enr_li_{lead_id}")
+            if st.button("Aplicar edición manual", use_container_width=True, key="enrich_manual_btn"):
+                lead["email"] = edited_email.strip()
+                lead["linkedin"] = edited_li.strip()
+                upsert_enriched_lead(lead)
+                st.success("Edición aplicada.")
+                st.rerun()
+    else:
+        confirm = st.checkbox(
+            f"Confirmo enriquecer en lote {len(base)} leads (email={do_email}, linkedin={do_linkedin})",
+            key="confirm_enrich_batch",
+        )
+        if st.button("Enriquecer lote", type="primary", use_container_width=True, disabled=not confirm, key="enrich_batch_btn"):
+            out = enrich_leads_batch(
+                base,
+                email_provider,
+                email_key,
+                do_email,
+                do_linkedin,
+                clay_li,
+                clay_key,
+            )
+            st.session_state.enriched_leads = out
+            # sync sourced
+            for _, row in out.iterrows():
+                upsert_enriched_lead(row.to_dict())
+            st.session_state.enrich_queue_idx = len(base)
+            st.success(f"Lote enriquecido: {len(out)} leads.")
+            st.rerun()
+
+    enriched = st.session_state.enriched_leads
+    if isinstance(enriched, pd.DataFrame) and not enriched.empty:
+        st.markdown("#### Resultado del enrichment")
+        m1, m2, m3 = st.columns(3)
+        m1.metric("Con email", int(enriched.get("email", pd.Series(dtype=str)).astype(str).str.len().gt(0).sum()) if "email" in enriched.columns else 0)
+        m2.metric("Con LinkedIn", int(enriched.get("linkedin", pd.Series(dtype=str)).astype(str).str.len().gt(0).sum()) if "linkedin" in enriched.columns else 0)
+        m3.metric("Total", len(enriched))
+        st.dataframe(
+            enriched[[c for c in ["nombre", "website", "email", "linkedin", "telefono", "enrichment_fuente", "fuente"] if c in enriched.columns]],
+            use_container_width=True,
+            hide_index=True,
+        )
+
+        st.markdown("#### Puerta de aprobación — Paso 2 → Paso 3 (Scoring)")
+        confirm2 = st.checkbox(
+            "Revisé emails/LinkedIn y quiero pasar estos leads a scoring",
+            key="confirm_enrich_gate",
+        )
+        if st.button(
+            "Aprobar enrichment y pasar a Scoring →",
+            type="primary",
+            use_container_width=True,
+            disabled=not confirm2,
+        ):
+            st.session_state.step_enrich_approved = True
+            st.session_state.pipeline_step = 3
+            # scoring should use enriched leads
+            st.session_state.scoring_queue_ids = enriched["id"].astype(str).tolist()
+            st.session_state.scoring_queue_idx = 0
+            st.success("Enrichment aprobado. Continuá en Scoring.")
+            st.rerun()
+        if st.session_state.step_enrich_approved:
+            st.success("✓ Enrichment aprobado — podés calificar en Scoring.")
+    else:
+        st.info("Todavía no hay leads enriquecidos.")
+
+
+
 def tab_scoring(cfg: dict[str, str]) -> None:
-    st.subheader("🧠 Paso 2 — Scoring e Inteligencia (supervisado)")
+    st.subheader("🧠 Paso 3 — Scoring e Inteligencia (supervisado)")
     st.write(
         "Calificá leads de a uno (recomendado) o en lote con confirmación. "
         "Revisá score, razón e icebreaker antes de aprobar el paso de despacho."
@@ -1481,12 +2134,23 @@ def tab_scoring(cfg: dict[str, str]) -> None:
 
     if not st.session_state.step1_approved:
         st.warning("Primero aprobá la selección en **Paso 1 (Sourcing)**.")
-        if st.button("Ir a Sourcing"):
+        if st.button("Ir a Sourcing", key="scoring_go_sourcing"):
             st.session_state.pipeline_step = 1
             st.rerun()
         return
+    if not st.session_state.step_enrich_approved:
+        st.warning("Primero completá y aprobá **Paso 2 (Enrichment)**.")
+        if st.button("Ir a Enrichment", key="scoring_go_enrich"):
+            st.session_state.pipeline_step = 2
+            st.rerun()
+        return
 
-    to_score = get_selected_sourced_leads()
+    enriched = st.session_state.get("enriched_leads", pd.DataFrame())
+    if isinstance(enriched, pd.DataFrame) and not enriched.empty:
+        to_score = enriched.copy()
+    else:
+        to_score = get_selected_sourced_leads()
+
     if to_score.empty:
         st.warning("No hay leads seleccionados para calificar.")
         return
@@ -1659,7 +2323,7 @@ def tab_scoring(cfg: dict[str, str]) -> None:
             st.rerun()
 
         high = st.session_state.high_leads
-        st.markdown("#### Puerta de aprobación — Paso 2 → Paso 3")
+        st.markdown("#### Puerta de aprobación — Paso 3 → Paso 4 (Despacho)")
         n_high = len(high) if isinstance(high, pd.DataFrame) else 0
         confirm2 = st.checkbox(
             f"Revisé los scores e icebreakers. Apruebo {n_high} lead(s) High para despacho",
@@ -1673,29 +2337,29 @@ def tab_scoring(cfg: dict[str, str]) -> None:
             disabled=not confirm2 or n_high == 0,
         ):
             st.session_state.step2_approved = True
-            st.session_state.pipeline_step = 3
+            st.session_state.pipeline_step = 5
             st.session_state.dispatch_approved_ids = high["id"].astype(str).tolist()
             st.session_state.dispatch_queue_ids = high["id"].astype(str).tolist()
             st.session_state.dispatch_queue_idx = 0
-            st.success("Paso 2 aprobado. Continuá en Despacho Outbound.")
+            st.success("Paso 3 aprobado. Continuá en Despacho Outbound.")
             st.rerun()
         if st.session_state.step2_approved:
-            st.success("✓ Paso 2 aprobado — podés despachar en la pestaña Outbound.")
+            st.success("✓ Paso 3 aprobado — podés despachar en Outbound.")
     else:
         st.info("Todavía no hay leads calificados. Usá el modo uno a uno o el lote.")
 
 
 def tab_dispatch(cfg: dict[str, str]) -> None:
-    st.subheader("🚀 Paso 3 — Despacho Outbound (supervisado)")
+    st.subheader("🚀 Paso 4 — Despacho Outbound (supervisado)")
     st.write(
         "Enviá leads High de a uno o el lote aprobado. Cada envío requiere confirmación "
         "explícita para que puedas supervisar el proceso."
     )
 
     if not st.session_state.step2_approved:
-        st.warning("Primero aprobá los leads High en **Paso 2 (Scoring)**.")
-        if st.button("Ir a Scoring"):
-            st.session_state.pipeline_step = 2
+        st.warning("Primero aprobá los leads High en **Paso 3 (Scoring)**.")
+        if st.button("Ir a Scoring", key="dispatch_go_scoring"):
+            st.session_state.pipeline_step = 3
             st.rerun()
         return
 
@@ -1863,14 +2527,14 @@ def tab_dispatch(cfg: dict[str, str]) -> None:
                 )
                 ok_n = sum(1 for r in logs if r["exito"] == "sí")
                 fail_n = len(logs) - ok_n
-                st.session_state.pipeline_step = 4
+                st.session_state.pipeline_step = 5
                 if ok_n:
                     st.success(f"Despacho finalizado: {ok_n} OK · {fail_n} fallidos. Revisá el CRM.")
                 else:
                     st.error(f"Ningún envío exitoso ({fail_n} fallidos).")
 
     if st.button("Marcar paso completado e ir al CRM →", use_container_width=True):
-        st.session_state.pipeline_step = 4
+        st.session_state.pipeline_step = 5
         st.rerun()
 
     st.markdown("#### Historial / log de envíos")
@@ -1888,7 +2552,7 @@ def tab_dispatch(cfg: dict[str, str]) -> None:
 
 
 def tab_crm(cfg: dict[str, str]) -> None:
-    st.subheader("📊 CRM Local y Agendamiento")
+    st.subheader("📊 Paso 5 — CRM Local y Agendamiento")
     st.write(
         f"Pipeline persistente en `{CRM_PATH.resolve()}`. "
         "Actualizá estados (Contactado → Respuesta → Agendado) y exportá a CSV/Excel."
@@ -2071,41 +2735,47 @@ def main() -> None:
     )
     init_session_state()
 
-    st.title("🎯 SDR Autónomo — Panel Unificado")
+    client = get_client(st.session_state.get("active_client_id", "katem-demo"))
+    st.title("🎯 SDR Autónomo — Katem")
     st.caption(
-        "Katem (katem.com.ar) · Guía Pilar (guia-pilar.com) — "
-        "Pipeline supervisado: Sourcing → Scoring → Outbound → CRM"
+        f"Vertical productizada de Katem · Workspace: **{client.get('name')}** "
+        f"({client.get('vertical')}) · "
+        "Sourcing → Enrichment → Scoring → Outbound → CRM"
     )
 
     cfg = render_sidebar()
     render_pipeline_stepper()
 
-    # Resaltar la pestaña del paso activo vía caption
     step = int(st.session_state.get("pipeline_step", 1))
     step_hints = {
-        1: "Estás en el paso de Sourcing: buscá y aprobá la selección.",
-        2: "Estás en Scoring: calificá de a uno o en lote con confirmación.",
-        3: "Estás en Despacho: enviá leads High con supervisión.",
-        4: "Estás en CRM: actualizá pipeline y exportá.",
+        1: "Sourcing: buscá leads y aprobá la selección.",
+        2: "Enrichment: completá email + LinkedIn (Clay) y aprobá.",
+        3: "Scoring: calificá de a uno o en lote confirmado.",
+        4: "Despacho: enviá High con supervisión.",
+        5: "CRM: actualizá pipeline y exportá.",
     }
     st.info(step_hints.get(step, ""))
 
-    tab1, tab2, tab3, tab4 = st.tabs(
+    tab1, tab2, tab3, tab4, tab5 = st.tabs(
         [
             "🔍 1. Sourcing",
-            "🧠 2. Scoring",
-            "🚀 3. Despacho",
-            "📊 4. CRM",
+            "✨ 2. Enrichment",
+            "🧠 3. Scoring",
+            "🚀 4. Despacho",
+            "📊 5. CRM",
         ]
     )
     with tab1:
         tab_sourcing(cfg)
     with tab2:
-        tab_scoring(cfg)
+        tab_enrichment(cfg)
     with tab3:
-        tab_dispatch(cfg)
+        tab_scoring(cfg)
     with tab4:
+        tab_dispatch(cfg)
+    with tab5:
         tab_crm(cfg)
+
 
 
 if __name__ == "__main__":
@@ -2142,7 +2812,7 @@ SUGERENCIAS DE MEJORA Y ARQUITECTURA FUTURA
      las claves de OpenAI/Instantly/Google.
 
 5) Productización del SDR
-   - Multi-usuario y multi-campaña, templates de icebreaker A/B, sync bidireccional
+   - Auth multi-usuario, billing por workspace, templates A/B de icebreaker, sync bidireccional
      con Instantly/Smartlead (replies → pipeline_status = Respuesta Recibida),
      y webhooks entrantes desde Cal.com para marcar "Agendado" automáticamente.
 """
@@ -2165,6 +2835,9 @@ GOOGLE_MAPS_KEY=AIzaxxxxxxxxxxxxxxxxxxxxxxxx
 APOLLO_API_KEY=apollo_xxxxxxxxxxxxxxxxxxxxxxxx
 CLAY_API_KEY=clay_xxxxxxxxxxxxxxxxxxxxxxxx
 CLAY_WEBHOOK_URL=https://api.clay.com/v1/webhooks/xxxxxxxx
+CLAY_LINKEDIN_WEBHOOK_URL=https://api.clay.com/v1/webhooks/linkedin-xxxxxxxx
+HUNTER_API_KEY=hunter_xxxxxxxxxxxxxxxxxxxxxxxx
+SNOV_API_KEY=snov_xxxxxxxxxxxxxxxxxxxxxxxx
 INSTANTLY_API_KEY=instantly_xxxxxxxxxxxxxxxxxx
 SMARTLEAD_API_KEY=
 INSTANTLY_CAMPAIGN_ID=campaign_xxxxxxxx

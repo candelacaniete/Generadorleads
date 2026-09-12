@@ -7,14 +7,22 @@ Panel unificado en Streamlit para el ciclo de prospección B2B:
 3. Despacho outbound a Instantly o webhook Make/n8n
 4. CRM local con pipeline y exportación CSV/Excel
 
+## Producto multi-cliente (vertical Katem)
+
+El panel es una **vertical de Katem** para ofrecer SDR Autónomo a múltiples clientes.
+Cada workspace (`clients/<id>/`) tiene su CRM, logs y config. Guía Pilar es un cliente ejemplo.
+
+Verticales template: directorios locales, B2B servicios, profesionales, retail.
+
 ## Pipeline supervisado
 
 El flujo **no se ejecuta todo junto**: cada etapa tiene una puerta de aprobación.
 
-1. **Sourcing** → elegí fuente (Places/Apollo/Clay), buscá, seleccioná y aprobá  
-2. **Scoring** → modo *uno a uno* (recomendado) o lote con confirmación; revisá score/icebreaker  
-3. **Despacho** → aprobá leads High uno a uno o en lote confirmado  
-4. **CRM** → actualizá estados y exportá  
+1. **Sourcing** → Places / Apollo / Clay · seleccioná y aprobá  
+2. **Enrichment** → email (Hunter/Snov/heurística) + LinkedIn vía Clay  
+3. **Scoring** → uno a uno o lote confirmado  
+4. **Despacho** → Instantly / webhook supervisado  
+5. **CRM** → pipeline + export  
 
 ## Inicio rápido
 
